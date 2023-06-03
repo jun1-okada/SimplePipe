@@ -67,10 +67,17 @@ int main()
     catch (winrt::hresult_error& ex)
     {
         //接続先がないなどの例外は winrt::hresult_error で捕捉する。
-        //例外の詳細はex.code にWindowsシステムエラーコードが格納させている
+        //例外の詳細はex.code() でHRESULT型に変換されたWindowsシステムエラーコードを取得する
         // エラーコードの詳細は以下のページを参照
+        // https://learn.microsoft.com/en-us/windows/win32/api/winerror/nf-winerror-hresult_from_win32
         // https://learn.microsoft.com/ja-jp/windows/win32/debug/system-error-codes--0-499-
-        std::wcerr << ex.message().c_str() << std::endl;
+        if (ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+            //サーバーとなるpipeが存在しない
+            std::wcerr << L"接続先が存在しません: " << PIPE_NAME << std::endl;
+        }
+        else {
+            std::wcerr << ex.message().c_str() << std::endl;
+        }
         return 1;
     }
     catch (std::exception& ex)

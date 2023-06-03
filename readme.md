@@ -114,10 +114,31 @@ SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) 
 *※ただし、プロセス間通信として利用している場合に非同期的に動作することは稀である。*
 
 # 例外処理
+## winrt::hresult_errorの注意点
+APIのエラーは `winrt::hresult_error` 例外として捕捉できるが、`winrt::hresult_error::code()` によって取得できるエラーコードはHRESULT型となっている。
+
+Win32エラーコードと比較する際は `HRESULT_FROM_WIN32` マクロで変換する必要がある。
+
+```cpp
+try{
+    ...
+catch(winrt::hresult_error& ex){
+   if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
+        std::wcerr << L"接続先が存在しない" << std::endl;
+    }
+    else if(ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)){
+        std::wcerr << L"すでに切断されている" << std::endl;
+    }
+    else {
+        std::wcerr << ex.message().c_str() << std::endl;
+    }
+ }
+```
+
 ## コンストラクタの例外
 `SimpleNamedPipeServer`, `SimpleNamedPipeClient` のコンストラクタでは、`winrt::hresult_error` を送出する。
 
-`winrt::hresult_error::code()` にてエラー発生時の `GetLastError()` のコードを取得できる。例えば、接続する名前付きパイプが存在しない場合は、`ERROR_FILE_NOT_FOUND` となる。
+`winrt::hresult_error::code()` にてエラーコードを取得できる。例えば、接続する名前付きパイプが存在しない場合は、`HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)` となる。
 
 ```cpp
 try{
@@ -125,7 +146,7 @@ try{
     ...
 }
 catch(winrt::hresult_error& ex){
-    if(ex.code() == ERROR_FILE_NOT_FOUND){
+    if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
         std::wcerr << L"接続先が存在しない" << std::endl;
     } 
     else {
@@ -166,7 +187,7 @@ catch(std::length_error& )
 
 監視タスク内で例外が発生した場合は、例外通知イベントから例外を検知できる。
 
-エラー発生イベントで発生例外を確認するには、コールバック第2引数の `PipeEventParam::errTask` を再評価することで例外の再送出を実行して捕捉した例外を確認する。
+エラー発生イベントで発生例外を確認するには、コールバック第2引数の `PipeEventParam::errTask.wait()` で再評価を行い例外を捕捉する。
 ```cpp
 TypicalSimpleNamedPipeClient pipeClient(PIPE_NAME, [&](auto&, const auto& param) {
     // ...

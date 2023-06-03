@@ -35,7 +35,17 @@ int main()
                     std::wostringstream oss;
                     oss << L"echo: " << message;
                     auto echoMessage(oss.str());
-                    ps.WriteAsync(echoMessage.c_str(), echoMessage.size() * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
+                    try {
+                        ps.WriteAsync(echoMessage.c_str(), echoMessage.size() * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
+                    }
+                    catch (winrt::hresult_error& ex) {
+                        if (ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)) {
+                            //winrt::hresult_error::code() は エラー コード値をHRESULTに変換された値を返すので比較する際に変換した値と比較する
+                            //クライアントは切断済み。これ以降も接続は受け付けるのでこのエラーはスルーする。
+                            break;
+                        }
+                        throw;
+                    }
                 }
                 break;
             case PipeEventType::EXCEPTION:
@@ -72,10 +82,16 @@ int main()
     catch (winrt::hresult_error& ex)
     {
         //接続先がないなどの例外は winrt::hresult_error で捕捉する。
-        //例外の詳細はex.code にWindowsシステムエラーコードが格納させている
+        //例外の詳細はex.code() でHRESULT型に変換されたWindowsシステムエラーコードを取得する
         // エラーコードの詳細は以下のページを参照
+        // https://learn.microsoft.com/en-us/windows/win32/api/winerror/nf-winerror-hresult_from_win32
         // https://learn.microsoft.com/ja-jp/windows/win32/debug/system-error-codes--0-499-
-        std::wcerr << ex.message().c_str() << std::endl;
+        if (ex.code() == HRESULT_FROM_WIN32(ERROR_PIPE_BUSY)) {
+            std::wcerr << L"既に実行中のサーバーが存在します: " << PIPE_NAME << std::endl;
+        }
+        else {
+            std::wcerr << ex.message().c_str() << std::endl;
+        }
 
         return 1;
     }

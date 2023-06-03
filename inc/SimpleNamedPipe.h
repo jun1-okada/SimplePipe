@@ -114,10 +114,12 @@ namespace abt::comm::simple_pipe
                     //切断状態となった
                     return false;
                 }
+                readOverlap.Offset = 0;
+                readOverlap.OffsetHigh = 0;
             }
             //同期的に受信データを取得できないかエラーの場合
             auto lastErr = GetLastError();
-            if (ERROR_HANDLE_EOF == lastErr || ERROR_BROKEN_PIPE == lastErr) {
+            if (ERROR_NO_DATA == lastErr || ERROR_BROKEN_PIPE == lastErr) {
                 //切断状態
                 return false;
             }
@@ -141,7 +143,7 @@ namespace abt::comm::simple_pipe
                     //データ受信を完了していない
                     return true;
                 }
-                if (ERROR_HANDLE_EOF == lastErr || ERROR_BROKEN_PIPE == lastErr) {
+                if (ERROR_NO_DATA == lastErr || ERROR_BROKEN_PIPE == lastErr) {
                     //切断状態
                     return false;
                 }
