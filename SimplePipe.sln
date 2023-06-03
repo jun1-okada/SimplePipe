@@ -7,7 +7,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SimplePipe", "SimplePipe\Si
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "inc", "inc", "{4FBB6E84-AEA6-4800-9FBE-4FB9BDAA862F}"
 	ProjectSection(SolutionItems) = preProject
-		Common\SimpleNamedPipe.h = Common\SimpleNamedPipe.h
+		inc\SimpleNamedPipe.h = inc\SimpleNamedPipe.h
 	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SimplePipeClient", "SimplePipeClient\SimplePipeClient.vcxproj", "{4671AE16-6253-49FC-8025-27E5BEE439AA}"
