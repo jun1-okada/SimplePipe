@@ -82,11 +82,15 @@ namespace abt::comm::simple_pipe
             Idle(Receiver* owner) : StateBase(owner) {}
             virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
             {
+                if (buffer.Size() < sizeof(Packet::size)) {
+                    owner->insufficient.Continue(buffer.Consume(buffer.Size()));
+                    return {&owner->insufficient, Buffer(buffer.End(),0)};
+                }
                 const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
                 if (packet->size > buffer.Size()) {
                     //パケットサイズが受信バッファー残サイズより大きい場合
                     owner->continuation.Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
-                    return { &owner->continuation, Buffer(buffer.End(),0)};
+                    return {&owner->continuation, Buffer(buffer.End(),0)};
                 }
                 return { this, buffer.Consume(packet->size) };
             }
@@ -98,19 +102,17 @@ namespace abt::comm::simple_pipe
         class Continuation final : public StateBase
         {
         private:
-            std::vector<BYTE> pool;
             size_t remain;
         public:
-            Continuation(Receiver* owner, size_t reserveSize)
+            Continuation(Receiver* owner)
                 : StateBase(owner), remain(0)
             {
-                pool.reserve(reserveSize);
             }
 
             void Continue(Buffer buffer, size_t totalRemain)
             {
-                pool.clear();
-                pool.insert(pool.end(), buffer.Start(), buffer.End());
+                owner->pool.clear();
+                owner->pool.insert(owner->pool.end(), buffer.Start(), buffer.End());
                 this->remain = totalRemain;
             }
 
@@ -118,19 +120,63 @@ namespace abt::comm::simple_pipe
             {
                 auto appendSize = (std::min)(buffer.Size(), remain);
                 auto appendBuf = buffer.Consume(appendSize);
-                pool.insert(pool.end(), appendBuf.Start(), appendBuf.End());
+                owner->pool.insert(owner->pool.end(), appendBuf.Start(), appendBuf.End());
                 remain -= appendSize;
                 if (0 == remain) {
                     //分割されたパケットを結合したものを戻り値とする
-                    return { &owner->idle, Buffer(&pool[0], pool.size()) };
+                    return { &owner->idle, Buffer(&owner->pool[0], owner->pool.size()) };
                 }
+                //完全なパケットが取得できた
                 return { this, Buffer(buffer.End(),0) };
             }
         };
 
+        /// <summary>
+        /// サイズを示したヘッダー領域が分割去れた状態
+        /// </summary>
+        class Insufficient final : public StateBase
+        {
+        public:
+            Insufficient(Receiver* owner)
+                : StateBase(owner)
+            {
+            }
+
+            void Continue(Buffer buffer)
+            {
+                owner->pool.clear();
+                owner->pool.insert(owner->pool.end(), buffer.Start(), buffer.End());
+            }
+
+            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+            {
+                auto prevEnd = owner->pool.end();
+                owner->pool.insert(owner->pool.end(), buffer.Start(), buffer.End());
+                if (owner->pool.size() < sizeof(Packet::size)) {
+                    //ヘッダー領域が受信できていない
+                    buffer.Consume(buffer.Size());
+                    return { this, Buffer(buffer.End(),0) };
+                }
+                const Packet* packet = reinterpret_cast<const Packet*>(&owner->pool[0]);
+                if (packet->size > owner->pool.size()) {
+                    //パケットサイズが受信バッファー残サイズより大きい場合
+                    auto appendSize = std::distance(prevEnd, owner->pool.end());
+                    buffer.Consume(appendSize);
+                    return { &owner->continuation, Buffer(buffer.End(),0) };
+                }
+                //完全なパケットが取得できた
+                auto consumeSize = packet->size - std::distance(owner->pool.begin(), prevEnd);
+                buffer.Consume(consumeSize);
+                return { &owner->idle,  Buffer(&owner->pool[0], packet->size)};
+            }
+
+        };
+
+        std::vector<BYTE> pool;
         ReceivedCallback callback;
         Idle idle;
         Continuation continuation;
+        Insufficient insufficient;
         StateBase* state;
 
     public:
@@ -149,9 +195,10 @@ namespace abt::comm::simple_pipe
         Receiver(size_t reserveSize, ReceivedCallback callback)
             : callback(callback)
             , idle(this)
-            , continuation(this, reserveSize)
+            , continuation(this)
             , state(&idle)
         {
+            pool.reserve(reserveSize);
         }
 
         /// <summary>
