@@ -2,6 +2,9 @@
 #include "pch.h"
 #include <iostream>
 #include <exception>
+#include <sstream>
+#include <tuple>
+#include <memory.h>
 #include "..\inc\SimpleNamedPipe.h"
 
 using namespace winrt;
@@ -20,6 +23,9 @@ int main()
     try {
         concurrency::event receivedEvent;
 
+        constexpr LONG repeat = 1000;
+        LONG remain = repeat;
+
         TypicalSimpleNamedPipeClient pipeClient(PIPE_NAME, [&](auto&, const auto& param) {
             //※イベントコールバックはスレッドが異なる可能性がある
             switch (param.type) {
@@ -31,9 +37,12 @@ int main()
             case PipeEventType::RECEIVED:
                 //データ受信
                 {
-                    auto message = std::wstring(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
-                    std::wcout << message << std::endl;
-                    receivedEvent.set();
+                    std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                    std::wcout << m << std::endl;
+                    if (0 == InterlockedDecrement(&remain)) {
+                        //echo受信完了
+                        receivedEvent.set();
+                    }
                 }
                 break;
             case PipeEventType::EXCEPTION:
@@ -59,7 +68,13 @@ int main()
             }
         });
 
-        pipeClient.WriteAsync(L"HELLO WORLD!", 13 * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
+        for (int i = 0; i < repeat; ++i) {
+            //メッセージを送信
+            std::wstringstream oss;
+            oss << L"HELLO WORLD! [" << i << "]";
+            std::wstring msg = oss.str();
+            pipeClient.WriteAsync(&msg[0], msg.size() * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
+        }
 
         //受信データ待ち
         receivedEvent.wait();

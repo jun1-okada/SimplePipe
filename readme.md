@@ -3,13 +3,13 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 
 # 特徴
 * ローカルマシン内のアプリ間での1対1の通信を想定した実装。
+* 送信と受信イベントが1:1で対応する。
 * 必要最小限の実装でシンプル。ヘッダーファイル `SimpleNamedPipe.h`をインクルードするだけで動く。
 * サービスやドライバーでも使えるように、`SECURITY_ATTRIBUTES` を指定可能。
 * Windows10 以降に対応。レガシー環境は考慮していない。
 * *winrt*, *ppl* に依存。
 * 非同期処理に対応。というか、非同期オンリー。
 * サイズが大きくないメッセージのやり取りを想定している。
-  * 大きなデータは共有メモリーなどを利用すべき。
 
 # 使い方
 ヘッダーファイル `SimpleNamedPipe.h` をinclude する。
@@ -17,7 +17,8 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 ## サーバー
 `SimpleNamedPipeServer<BUF_SIZE>` でサーバーインスタンスを生成する。
 
-`BUF_SIZE` は受信バッファーサイズを指定する。`BUIF_SIZE` は `WriteAsync` 実行時の送信サイズ上限になる。
+`BUF_SIZE` は受信バッファーサイズを指定する。`BUIF_SIZE - 4byte` が `WriteAsync` 実行時の送信サイズ上限になる。4byteは送信サイズ領域。
+
 
 第2引数に `LPSECURITY_ATTRIBUTES` を指定可能。nullptr時は既定のセキュリティ記述子となる。
 
@@ -62,7 +63,7 @@ SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const a
 ## クライアント
 `SimpleNamedPipeClient<BUF_SIZE>` でクライアントインスタンスを生成する。
 
-`BUF_SIZE` は受信バッファーサイズを指定する。`BUIF_SIZE` は `WriteAsync` 実行時の送信サイズ上限になる。
+`BUF_SIZE` は受信バッファーサイズを指定する。`BUIF_SIZE - 4byte` が `WriteAsync` 実行時の送信サイズ上限になる。4byteは送信サイズ領域。
 
 `TypicalSimpleNamedPipeClient` は `SimpleNamedPipeClient<2048>` のエイリアスとして定義している。
 
@@ -107,11 +108,7 @@ SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) 
 そのため、継続して受信バッファーの内容を利用する場合はコピーする必要がある。
 
 ## 送信データについて
-`WritaAsync` が非同期で実行されている場合は、実際に送信処理が行われるまで保持する必要がある。
-
-`wait` 関数で同期的に待機する、`then` 関数で継続タスク中で後始末をするなどの対応が必要。
-
-*※ただし、プロセス間通信として利用している場合に非同期的に動作することは稀である。*
+非同期で動作するため戻り値として `concurrency::task<void>` を返す。 `wait` 関数で同期的に待機する、`then` 関数で継続タスク中で後始末をするなどの対応が必要。
 
 # 例外処理
 ## winrt::hresult_errorの注意点

@@ -19,7 +19,7 @@ int main()
     std::wcout.imbue(std::locale(""));
     std::wcerr.imbue(std::locale(""));
     try {
-        TypicalSimpleNamedPipeServer pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const auto& param) {
+        TypicalSimpleNamedPipeServer ppipeServer(PIPE_NAME, nullptr, [&](auto& ps, const auto& param) {
             //※イベントコールバックはスレッドが異なる可能性がある
             switch (param.type) {
             case PipeEventType::CONNECTED:
@@ -30,19 +30,19 @@ int main()
                 break;
             case PipeEventType::RECEIVED:
                 {
-                    auto message = std::wstring(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
-                    std::wcout << message << std::endl;
+                    std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                    std::wcout << m << std::endl;
                     std::wostringstream oss;
-                    oss << L"echo: " << message;
-                    auto echoMessage(oss.str());
+                    oss << L"echo: " << m;
+                    std::wstring echoMessage = oss.str();
                     try {
-                        ps.WriteAsync(echoMessage.c_str(), echoMessage.size() * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
+                        ps.WriteAsync(&echoMessage[0], echoMessage.size() * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
                     }
                     catch (winrt::hresult_error& ex) {
                         if (ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)) {
                             //winrt::hresult_error::code() は エラー コード値をHRESULTに変換された値を返すので比較する際に変換した値と比較する
                             //クライアントは切断済み。これ以降も接続は受け付けるのでこのエラーはスルーする。
-                            break;
+                            return;
                         }
                         throw;
                     }

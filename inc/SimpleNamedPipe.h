@@ -4,14 +4,185 @@
 #include <memory>
 #include <functional>
 #include <optional>
-
 #include <winrt/base.h>
-
 #include <ppl.h>
 #include <ppltasks.h>
 
 namespace abt::comm::simple_pipe
 {
+    using ReceivedCallback = std::function<void(LPCVOID, size_t)>;
+
+    /// <summary>
+    /// データパケット
+    /// </summary>
+    struct Packet
+    {
+        //size分も含めた全体のサイズ
+        alignas(4) DWORD size;
+        BYTE data[1];
+    };
+
+    /// <summary>
+    /// 受信データ復号クラス
+    /// </summary>
+    class Receiver
+    {
+    private:
+        /// <summary>
+        /// 受信バッファー管理クラス
+        /// </summary>
+        class Buffer
+        {
+        private:
+            const BYTE* sp;
+            const BYTE* ep;
+        public:
+            Buffer(LPCVOID buffer, size_t size)
+                : sp(reinterpret_cast<const BYTE*>(buffer))
+                , ep(reinterpret_cast<const BYTE*>(buffer) + size)
+            {}
+
+            const BYTE* Start() const { return sp; }
+            const BYTE* End() const { return ep; }
+            bool Empty() const { return sp == ep; }
+            const BYTE* Pointer() const { return sp; }
+            size_t Size() const { return std::distance(sp, ep); }
+            Buffer Consume(size_t size)
+            {
+                if (size > Size()) {
+                    throw std::length_error("size is too large");
+                }
+                auto preSp = sp;
+                sp += size;
+                return Buffer(preSp, size);
+            }
+        };
+
+        //受信ステート基底クラス
+        class StateBase
+        {
+        protected:
+            Receiver* owner;
+            StateBase() : owner(nullptr) {}
+            StateBase(Receiver* owner) : owner(owner) {}
+        public:
+            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) = 0;
+            virtual ~StateBase() {}
+        };
+
+        class Idle;
+        class Continuation;
+
+        /// <summary>
+        /// 連続した受信をまたがない状態
+        /// </summary>
+        class Idle final : public StateBase
+        {
+        public:
+            Idle(Receiver* owner) : StateBase(owner) {}
+            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+            {
+                const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
+                if (packet->size > buffer.Size()) {
+                    //パケットサイズが受信バッファー残サイズより大きい場合
+                    owner->continuation.Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
+                    return { &owner->continuation, Buffer(buffer.End(),0)};
+                }
+                return { this, buffer.Consume(packet->size) };
+            }
+        };
+
+        /// <summary>
+        /// 連続した受信をまたぐ状態
+        /// </summary>
+        class Continuation final : public StateBase
+        {
+        private:
+            std::vector<BYTE> pool;
+            size_t remain;
+        public:
+            Continuation(Receiver* owner, size_t reserveSize)
+                : StateBase(owner), remain(0)
+            {
+                pool.reserve(reserveSize);
+            }
+
+            void Continue(Buffer buffer, size_t totalRemain)
+            {
+                pool.clear();
+                pool.insert(pool.end(), buffer.Start(), buffer.End());
+                this->remain = totalRemain;
+            }
+
+            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+            {
+                auto appendSize = (std::min)(buffer.Size(), remain);
+                auto appendBuf = buffer.Consume(appendSize);
+                pool.insert(pool.end(), appendBuf.Start(), appendBuf.End());
+                remain -= appendSize;
+                if (0 == remain) {
+                    //分割されたパケットを結合したものを戻り値とする
+                    return { &owner->idle, Buffer(&pool[0], pool.size()) };
+                }
+                return { this, Buffer(buffer.End(),0) };
+            }
+        };
+
+        ReceivedCallback callback;
+        Idle idle;
+        Continuation continuation;
+        StateBase* state;
+
+    public:
+        Receiver() = delete;
+        Receiver(Receiver&&) = delete;
+        Receiver(const Receiver&) = delete;
+
+        Receiver& operator=(Receiver&&) = delete;
+        Receiver& operator=(const Receiver&) = delete;
+
+        /// <summary>
+        /// コンストラクタ
+        /// </summary>
+        /// <param name="reserveSize">バッファーリザーブサイズ</param>
+        /// <param name="callback">受信コールバック</param>
+        Receiver(size_t reserveSize, ReceivedCallback callback)
+            : callback(callback)
+            , idle(this)
+            , continuation(this, reserveSize)
+            , state(&idle)
+        {
+        }
+
+        /// <summary>
+        /// 受信データ処理
+        /// </summary>
+        /// <param name="p">受信バッファー</param>
+        /// <param name="size">サイズ</param>
+        void Feed(LPCVOID p, size_t size)
+        {
+            auto buffer = Buffer(p, size);
+            //バッファー内をすべて処理するまで繰り返し
+            while (!buffer.Empty()) {
+                std::tuple<StateBase*, Buffer> res = state->Feed(buffer);
+                state = std::get<0>(res);
+                if (!std::get<1>(res).Empty()) {
+                    const Packet* packet = reinterpret_cast<const Packet*>(std::get<1>(res).Pointer());
+                    callback(packet->data, packet->size - sizeof(packet->size));
+                }
+            }
+        }
+
+        /// <summary>
+        /// 初期状態にリセット
+        /// </summary>
+        void Reset()
+        {
+            state = &idle;
+        }
+    };
+
+
     //バッファーサイズ
     constexpr DWORD TYPICAL_BUFFER_SIZE = 2048;
 
@@ -49,20 +220,21 @@ namespace abt::comm::simple_pipe
     template<DWORD BUF_SIZE>
     class SimpleNamedPipeBase
     {
-    public:
-        using ReceivedCallback = std::function<void(LPCVOID, size_t)>;
-
     private:
         //パイプハンドル
         winrt::file_handle handlePipe;
-        //受信コールバック
-        ReceivedCallback receivedCallback;
         //受信用オーバーラップ構造体
         OVERLAPPED readOverlap ;
         //受信バッファー
         std::unique_ptr<BYTE[]> readBuffer;
         //受信イベント
         winrt::handle readEvent;
+        //受信パケット処理
+        std::unique_ptr<Receiver> receiver;
+        //送信バッファー
+        std::unique_ptr<BYTE[]> writeBuffer;
+        //送信バッファー利用可イベント
+        std::unique_ptr<concurrency::event> writableEvent;
 
     public:
         static const DWORD BUFFER_SIZE = BUF_SIZE;
@@ -81,13 +253,19 @@ namespace abt::comm::simple_pipe
         /// <param name="receivedCallback">データ受信コールバック。受信データは関数呼び出し中でのみ有効。</param>
         SimpleNamedPipeBase(winrt::file_handle&& handlePipe, ReceivedCallback receivedCallback)
             : handlePipe(std::move(handlePipe))
-            , receivedCallback(receivedCallback)
             , readOverlap({ 0 })
             , readBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
+            , receiver(std::make_unique<Receiver>(BUF_SIZE, receivedCallback))
+            , writeBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
+            , writableEvent(std::make_unique<concurrency::event>())
         {
+            if constexpr(BUF_SIZE <= sizeof(Packet::size)) {
+                throw std::runtime_error("BUF_SIZE is too short");
+            }
             readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(static_cast<bool>(readEvent));
             readOverlap.hEvent = readEvent.get();
+            writableEvent->set();
         }
 
         virtual ~SimpleNamedPipeBase() {}
@@ -96,6 +274,7 @@ namespace abt::comm::simple_pipe
         const bool Valid() { return static_cast<bool>(handlePipe); }
         const std::unique_ptr<BYTE[]>& ReadBuffer() { return readBuffer; }
         const winrt::handle& ReadEvent() { return readEvent; }
+        void Reset() { receiver->Reset(); }
 
         /// <summary>
         /// 非同期受信開始
@@ -151,7 +330,7 @@ namespace abt::comm::simple_pipe
                 winrt::throw_last_error();
             }
             //データ受信
-            receivedCallback(readBuffer.get(), readSize);
+            receiver->Feed(readBuffer.get(), readSize);
             return true;
         }
 
@@ -170,6 +349,13 @@ namespace abt::comm::simple_pipe
             return connected;
         }
 
+        struct Defer {
+            std::function<void(void)> func;
+            Defer(std::function<void(void)> func) : func(func) {}
+            ~Defer() { if(func) func(); }
+            void Detach() { func = std::function<void(void)>(); }
+        };
+
         /// <summary>
         /// 非同期送信処理
         /// </summary>
@@ -184,19 +370,31 @@ namespace abt::comm::simple_pipe
                 throw std::runtime_error("this instance is invalid");
             }
 
-            if (size > BUF_SIZE) {
+            if (size > BUF_SIZE - sizeof(Packet::size) ) {
                 //バッファーサイズより大きい場合はエラー
                 throw std::length_error("size is too long");
             }
 
+            //書き込み中ならば待ち
+            writableEvent->wait();
+            //書込み可能イベントリセット
+            writableEvent->reset();
+            Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
+
             //送信完了イベント
             winrt::handle writeEvent{CreateEventW(nullptr, true, false, nullptr)};
             winrt::check_bool(static_cast<bool>(writeEvent));
+
+            //送信バッファーへコピー
+            auto packet = reinterpret_cast<Packet*>(writeBuffer.get());
+            packet->size = static_cast<DWORD>(size + sizeof(Packet::size));
+            memcpy(packet->data, buffer, size);
+
             //オーバーラップ構造体の設定
             OVERLAPPED overlapped = { 0 };
             overlapped.hEvent = writeEvent.get();
             //非同期送信
-            if (WriteFile(handlePipe.get(), buffer, static_cast<DWORD>(size), nullptr, &overlapped)) {
+            if (WriteFile(handlePipe.get(), writeBuffer.get(), static_cast<DWORD>(packet->size), nullptr, &overlapped)) {
                 //同期で処理完了
                 return concurrency::task_from_result();
             }
@@ -205,12 +403,14 @@ namespace abt::comm::simple_pipe
                 //完了待ち以外ではエラー
                 winrt::throw_last_error();
             }
-            //taskに引き継ぐためイベントはデタッチする
             writeEvent.detach();
+            defer.Detach();
 
-            //非同期時の送信完了町のためのタスク
+            //非同期時の送信完了待機のタスク
             return concurrency::create_task([this, overlapped, ct]() {
+                Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
                 std::vector<HANDLE> handles;
+                winrt::handle writeEvent(overlapped.hEvent);
                 winrt::handle cancelEvent;
                 if (ct.is_cancelable()) {
                     //キャンセル可能な場合のイベントディスパッチ処理
@@ -223,8 +423,6 @@ namespace abt::comm::simple_pipe
                         });
                     handles.emplace_back(cancelEvent.get());
                 }
-
-                auto writeEvent = winrt::handle(overlapped.hEvent);
                 handles.emplace_back(writeEvent.get());
 
                 //書き込み完了、もしくは中断まで待機
@@ -234,8 +432,7 @@ namespace abt::comm::simple_pipe
                     //書き込み完了、もしくはキャンセル
                     ResetEvent(handles[index]);
                 }
-                return;
-                }, concurrency::task_options(ct));
+            }, concurrency::task_options(ct));
         }
 
         void Close()
@@ -336,6 +533,7 @@ namespace abt::comm::simple_pipe
                     winrt::throw_last_error();
                 }
             }
+            base.Reset();
         }
 
         /// <summary>
@@ -347,11 +545,11 @@ namespace abt::comm::simple_pipe
         }
 
     public:
-        SimpleNamedPipeServer() = default;
-        SimpleNamedPipeServer(SimpleNamedPipeServer&&) = default;
+        SimpleNamedPipeServer() = delete;
+        SimpleNamedPipeServer(SimpleNamedPipeServer&&) = delete;
         SimpleNamedPipeServer(const SimpleNamedPipeServer&) = delete;
 
-        SimpleNamedPipeServer& operator=(SimpleNamedPipeServer&&) = default;
+        SimpleNamedPipeServer& operator=(SimpleNamedPipeServer&&) = delete;
         SimpleNamedPipeServer& operator=(const SimpleNamedPipeServer&) = delete;
 
         /// <summary>
@@ -476,27 +674,27 @@ namespace abt::comm::simple_pipe
                                 callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
                             }
                         }
-                        else {
-                            auto index2 = res - WAIT_ABANDONED_0;
-                            if (0 <= index2 && index2 < _countof(handles)) {
-                                //いずれかのハンドルが破棄されたのならインスタンスが破棄されている
-                                break;
-                            }
+                    }
+                    else {
+                        auto index2 = res - WAIT_ABANDONED_0;
+                        if (0 <= index2 && index2 < _countof(handles)) {
+                            //いずれかのハンドルが破棄されたのならインスタンスが破棄されている
+                            break;
                         }
                     }
                 }
                 //監視スレッド終了後はこのインスタンスは利用できない
                 Close();
-                });
+            });
         }
 
     public:
-        SimpleNamedPipeClient() = default;
+        SimpleNamedPipeClient() = delete;
         SimpleNamedPipeClient(const SimpleNamedPipeClient&) = delete;
         SimpleNamedPipeClient& operator=(const SimpleNamedPipeClient&) = delete;
 
-        SimpleNamedPipeClient(SimpleNamedPipeClient&&) = default;
-        SimpleNamedPipeClient& operator=(SimpleNamedPipeClient&&) = default;
+        SimpleNamedPipeClient(SimpleNamedPipeClient&&) = delete;
+        SimpleNamedPipeClient& operator=(SimpleNamedPipeClient&&) = delete;
 
         /// <summary>
         /// コンストラクタ
