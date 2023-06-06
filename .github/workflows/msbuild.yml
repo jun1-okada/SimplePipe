@@ -49,5 +49,5 @@ jobs:
     - name: Run VSTest
       id: run_vstest
       working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: vstest.console.exe /Platform:x64 .\x64\Release\TestSimplePipe.dll /platform:x64
+      run: vstest.console.exe /Platform:x64 .\x64\Release\TestSimplePipe.dll
       
