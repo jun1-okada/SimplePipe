@@ -58,20 +58,32 @@ namespace abt::comm::simple_pipe
             }
         };
 
-        //受信ステート基底クラス
+        class Idle;
+        class Continuation;
+        class Insufficient;
+
+        /// <summary>
+        /// 受信ステート基底クラス
+        /// </summary>
         class StateBase
         {
         protected:
             Receiver* owner;
             StateBase() : owner(nullptr) {}
             StateBase(Receiver* owner) : owner(owner) {}
+
+        protected:
+            inline size_t LimitSize() const { return owner->limitSize; }
+            inline std::vector<BYTE>& Pool() { return owner->pool; }
+
+            inline Idle& Idle() { return owner->idle; }
+            inline Continuation& Continuation() { return owner->continuation; }
+            inline Insufficient& Insufficient() { return owner->insufficient; }
+
         public:
             virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) = 0;
             virtual ~StateBase() {}
         };
-
-        class Idle;
-        class Continuation;
 
         /// <summary>
         /// 連続した受信をまたがない状態
@@ -82,12 +94,23 @@ namespace abt::comm::simple_pipe
             Idle(Receiver* owner) : StateBase(owner) {}
             virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
             {
+                if (buffer.Size() < sizeof(Packet::size)) {
+                    //ヘッダー部を完全に受信できていない
+                    // Insufficientステートをセットアップして次回以降に続きを受信
+                    Insufficient().Continue(buffer.Consume(buffer.Size()));
+                    return {&Insufficient(), Buffer(buffer.End(),0)};
+                }
                 const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
+                if (packet->size > LimitSize()) {
+                    throw std::length_error("packet size is too long");
+                }
                 if (packet->size > buffer.Size()) {
                     //パケットサイズが受信バッファー残サイズより大きい場合
-                    owner->continuation.Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
-                    return { &owner->continuation, Buffer(buffer.End(),0)};
+                    // Continuationをセットアップして続きは次回以降に取得
+                    Continuation().Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
+                    return {&Continuation(), Buffer(buffer.End(),0)};
                 }
+                //1パケット受信
                 return { this, buffer.Consume(packet->size) };
             }
         };
@@ -98,19 +121,31 @@ namespace abt::comm::simple_pipe
         class Continuation final : public StateBase
         {
         private:
-            std::vector<BYTE> pool;
             size_t remain;
         public:
-            Continuation(Receiver* owner, size_t reserveSize)
+            Continuation(Receiver* owner)
                 : StateBase(owner), remain(0)
             {
-                pool.reserve(reserveSize);
             }
 
+            /// <summary>
+            /// 受信済みデータをプール領域にセットアップ
+            /// </summary>
+            /// <param name="buffer">プール領域へ保存するバッファー</param>
+            /// <param name="totalRemain">未受信データサイズ</param>
             void Continue(Buffer buffer, size_t totalRemain)
             {
-                pool.clear();
-                pool.insert(pool.end(), buffer.Start(), buffer.End());
+                Pool().clear();
+                Pool().insert(Pool().end(), buffer.Start(), buffer.End());
+                this->remain = totalRemain;
+            }
+
+            /// <summary>
+            /// 未受信データサイズをセットアップ。プール領域にはすでに受信済みデータが存在することが前提。
+            /// </summary>
+            /// <param name="totalRemain">未受信データサイズ</param>
+            void Continue(size_t totalRemain)
+            {
                 this->remain = totalRemain;
             }
 
@@ -118,19 +153,76 @@ namespace abt::comm::simple_pipe
             {
                 auto appendSize = (std::min)(buffer.Size(), remain);
                 auto appendBuf = buffer.Consume(appendSize);
-                pool.insert(pool.end(), appendBuf.Start(), appendBuf.End());
+                Pool().insert(Pool().end(), appendBuf.Start(), appendBuf.End());
                 remain -= appendSize;
                 if (0 == remain) {
                     //分割されたパケットを結合したものを戻り値とする
-                    return { &owner->idle, Buffer(&pool[0], pool.size()) };
+                    return { &Idle(), Buffer(&Pool()[0], Pool().size())};
                 }
+                //まだ必要サイズに満たないので受信処理を継続
                 return { this, Buffer(buffer.End(),0) };
             }
         };
 
+        /// <summary>
+        /// ヘッダー領域途中で分割されている場合
+        /// </summary>
+        class Insufficient final : public StateBase
+        {
+        public:
+            Insufficient(Receiver* owner)
+                : StateBase(owner)
+            {
+            }
+
+            /// <summary>
+            /// 受信済みデータをプール領域にセットアップ
+            /// </summary>
+            /// <param name="buffer">プール領域へ保存するバッファー</param>
+            void Continue(Buffer buffer)
+            {
+                Pool().clear();
+                Pool().insert(Pool().end(), buffer.Start(), buffer.End());
+            }
+
+            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+            {
+                auto prevSize = static_cast<DWORD>(Pool().size());
+                Pool().insert(Pool().end(), buffer.Start(), buffer.End());
+                if (Pool().size() < sizeof(Packet::size)) {
+                    //ヘッダー領域が受信できていない
+                    auto consumed = buffer.Consume(buffer.Size());
+                    return { this, Buffer(buffer.End(),0) };
+                }
+                const Packet* packet = reinterpret_cast<const Packet*>(&Pool()[0]);
+                if (packet->size > LimitSize()) {
+                    throw std::length_error("packet size is too long");
+                }
+                const DWORD remain = packet->size - prevSize;
+                if (remain > buffer.Size() ) {
+                    //パケットサイズが受信バッファー残サイズより大きい場合
+                    Continuation().Continue(remain - buffer.Size());
+                    buffer.Consume(buffer.Size());
+                    return { &Continuation(), Buffer(buffer.End(),0) };
+                }
+                //完全なパケットが取得できた
+                buffer.Consume(remain);
+                return { &Idle(),  Buffer(&Pool()[0], packet->size)};
+            }
+
+        };
+
+        //パケットサイズ上限
+        const size_t limitSize;
+
+        //受信バッファーをまたいだ場合の一時保存領域
+        std::vector<BYTE> pool;
+
         ReceivedCallback callback;
+
         Idle idle;
         Continuation continuation;
+        Insufficient insufficient;
         StateBase* state;
 
     public:
@@ -144,14 +236,17 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// コンストラクタ
         /// </summary>
-        /// <param name="reserveSize">バッファーリザーブサイズ</param>
+        /// <param name="limitSize">受信サイズ上限</param>
         /// <param name="callback">受信コールバック</param>
-        Receiver(size_t reserveSize, ReceivedCallback callback)
-            : callback(callback)
+        Receiver(size_t limitSize, ReceivedCallback callback)
+            : limitSize(limitSize)
+            , callback(callback)
             , idle(this)
-            , continuation(this, reserveSize)
+            , continuation(this)
+            , insufficient(this)
             , state(&idle)
         {
+            pool.reserve(limitSize);
         }
 
         /// <summary>
@@ -379,6 +474,7 @@ namespace abt::comm::simple_pipe
             writableEvent->wait();
             //書込み可能イベントリセット
             writableEvent->reset();
+            //同期的に書き込み完了した際にイベントセットする
             Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
 
             //送信完了イベント
@@ -403,13 +499,17 @@ namespace abt::comm::simple_pipe
                 //完了待ち以外ではエラー
                 winrt::throw_last_error();
             }
+
+            //タスクへ引き継ぐために同期オブジェクトはデタッチして変更されないようにする
             writeEvent.detach();
             defer.Detach();
 
             //非同期時の送信完了待機のタスク
             return concurrency::create_task([this, overlapped, ct]() {
+                //タスクから抜けた際に書き込み可能イベントをセット
                 Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
                 std::vector<HANDLE> handles;
+                //非同期書き込みイベントを終了時に開放するようにしておく
                 winrt::handle writeEvent(overlapped.hEvent);
                 winrt::handle cancelEvent;
                 if (ct.is_cancelable()) {
