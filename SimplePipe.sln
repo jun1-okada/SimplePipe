@@ -12,6 +12,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "inc", "inc", "{4FBB6E84-AEA
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SimplePipeClient", "SimplePipeClient\SimplePipeClient.vcxproj", "{4671AE16-6253-49FC-8025-27E5BEE439AA}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TestSimplePipe", "TestSimplePipe\TestSimplePipe.vcxproj", "{529C7921-645B-4470-820C-22C40D8030F9}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -36,6 +38,14 @@ Global
 		{4671AE16-6253-49FC-8025-27E5BEE439AA}.Release|x64.Build.0 = Release|x64
 		{4671AE16-6253-49FC-8025-27E5BEE439AA}.Release|x86.ActiveCfg = Release|Win32
 		{4671AE16-6253-49FC-8025-27E5BEE439AA}.Release|x86.Build.0 = Release|Win32
+		{529C7921-645B-4470-820C-22C40D8030F9}.Debug|x64.ActiveCfg = Debug|x64
+		{529C7921-645B-4470-820C-22C40D8030F9}.Debug|x64.Build.0 = Debug|x64
+		{529C7921-645B-4470-820C-22C40D8030F9}.Debug|x86.ActiveCfg = Debug|Win32
+		{529C7921-645B-4470-820C-22C40D8030F9}.Debug|x86.Build.0 = Debug|Win32
+		{529C7921-645B-4470-820C-22C40D8030F9}.Release|x64.ActiveCfg = Release|x64
+		{529C7921-645B-4470-820C-22C40D8030F9}.Release|x64.Build.0 = Release|x64
+		{529C7921-645B-4470-820C-22C40D8030F9}.Release|x86.ActiveCfg = Release|Win32
+		{529C7921-645B-4470-820C-22C40D8030F9}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
