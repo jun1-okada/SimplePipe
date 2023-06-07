@@ -407,7 +407,9 @@ namespace abt::comm::simple_pipe
             }
             //同期的に受信データを取得できないかエラーの場合
             auto lastErr = GetLastError();
-            if (ERROR_NO_DATA == lastErr || ERROR_BROKEN_PIPE == lastErr) {
+            if (ERROR_PIPE_NOT_CONNECTED == lastErr
+                    || ERROR_BROKEN_PIPE == lastErr
+                    || ERROR_PIPE_LISTENING == lastErr) {
                 //切断状態
                 return false;
             }
@@ -435,7 +437,9 @@ namespace abt::comm::simple_pipe
                     //データ受信を完了していない
                     return true;
                 }
-                if (ERROR_NO_DATA == lastErr || ERROR_BROKEN_PIPE == lastErr) {
+                if (ERROR_PIPE_NOT_CONNECTED == lastErr
+                        || ERROR_BROKEN_PIPE == lastErr
+                        || ERROR_PIPE_LISTENING == lastErr) {
                     //切断状態
                     return false;
                 }
@@ -668,9 +672,7 @@ namespace abt::comm::simple_pipe
                             //切断コールバック
                             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
                             //終了した接続の後始末をして次回接続の待機
-                            FlushFileBuffers(base.Handle());
-                            winrt::check_bool(DisconnectNamedPipe(base.Handle()));
-                            BeginConnect();
+                            Disconnect();
                         }
                     }
                     else {
@@ -693,7 +695,9 @@ namespace abt::comm::simple_pipe
         {
             if (!ConnectNamedPipe(base.Handle(), &connectionOverlap)) {
                 auto lastErr = GetLastError();
-                if (ERROR_PIPE_LISTENING != lastErr && ERROR_IO_PENDING != lastErr && ERROR_PIPE_CONNECTED != lastErr) {
+                if (ERROR_PIPE_LISTENING != lastErr
+                        && ERROR_IO_PENDING != lastErr
+                        && ERROR_PIPE_CONNECTED != lastErr) {
                     //ペンディングではない場合の名前付きパイプ接続失敗
                     winrt::throw_last_error();
                 }
@@ -786,6 +790,17 @@ namespace abt::comm::simple_pipe
         {
             winrt::check_bool(SetEvent(stopEvent.get()));
             base.Close();
+        }
+
+        /// <summary>
+        /// 接続中のClientを切断する
+        /// </summary>
+        virtual void Disconnect()
+        {
+            FlushFileBuffers(base.Handle());
+            winrt::check_bool(DisconnectNamedPipe(base.Handle()));
+            //次回接続待ち開始
+            BeginConnect();
         }
 
         virtual ~SimpleNamedPipeServer()

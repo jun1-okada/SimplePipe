@@ -308,7 +308,7 @@ namespace abt::comm::simple_pipe::test
                     oss << L"echo: " << m;
                     std::wstring echoMessage = oss.str();
                     ps.WriteAsync(&echoMessage[0], echoMessage.size() * sizeof(WCHAR)).wait();
-                    ps.Close();
+                    ps.Disconnect();
                 }
                 break;
                 case PipeEventType::EXCEPTION:
@@ -320,47 +320,94 @@ namespace abt::comm::simple_pipe::test
                 }
             });
 
+            //未接続のときにDionnectを読んでも副作用はない
+            server.Disconnect();
+
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
             std::wstring echoMessage;
 
-            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
-                switch (param.type) {
-                case PipeEventType::DISCONNECTED:
-                    break;
-                case PipeEventType::RECEIVED:
-                {
-                    std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
-                    echoMessage = m;
-                    echoComplete.set();
-                }
-                break;
-                case PipeEventType::EXCEPTION:
-                    //監視タスクで例外発生
-                    if (param.errTask) {
-                        clientErrTask = param.errTask.value();
+            {
+                TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                    switch (param.type) {
+                    case PipeEventType::DISCONNECTED:
+                        break;
+                    case PipeEventType::RECEIVED:
+                    {
+                        std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                        echoMessage = m;
+                        echoComplete.set();
                     }
                     break;
+                    case PipeEventType::EXCEPTION:
+                        //監視タスクで例外発生
+                        if (param.errTask) {
+                            clientErrTask = param.errTask.value();
+                        }
+                        break;
+                    }
+                });
+
+                WCHAR hello[] = L"HELLO WORLD![1]";
+
+                client.WriteAsync(&hello[0], sizeof(hello)).wait();
+
+                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+                    Assert::Fail();
                 }
-            });
 
-            WCHAR hello[] = L"HELLO WORLD!";
+                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+                    Assert::Fail();
+                }
 
-            client.WriteAsync(&hello[0], sizeof(hello)).wait();
+                serverErrTask.wait();
+                clientErrTask.wait();
 
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
-                Assert::Fail();
+                Assert::AreEqual(std::wstring(L"echo: HELLO WORLD![1]"), echoMessage);
             }
 
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
-                Assert::Fail();
+            echoComplete.reset();
+            closedEvent.reset();
+
+            //切断後も再接続できるか？
+            {
+                TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                    switch (param.type) {
+                    case PipeEventType::DISCONNECTED:
+                        break;
+                    case PipeEventType::RECEIVED:
+                    {
+                        std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                        echoMessage = m;
+                        echoComplete.set();
+                    }
+                    break;
+                    case PipeEventType::EXCEPTION:
+                        //監視タスクで例外発生
+                        if (param.errTask) {
+                            clientErrTask = param.errTask.value();
+                        }
+                        break;
+                    }
+                });
+
+                WCHAR hello[] = L"HELLO WORLD![2]";
+
+                client.WriteAsync(&hello[0], sizeof(hello)).wait();
+
+                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+                    Assert::Fail();
+                }
+
+                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+                    Assert::Fail();
+                }
+                serverErrTask.wait();
+                clientErrTask.wait();
+
+                Assert::AreEqual(std::wstring(L"echo: HELLO WORLD![2]"), echoMessage);
             }
             server.Close();
-
-            serverErrTask.wait();
-            clientErrTask.wait();
-
-            Assert::AreEqual(std::wstring(L"echo: HELLO WORLD!"), echoMessage);
         }
 
         TEST_METHOD(WriteCancel)
