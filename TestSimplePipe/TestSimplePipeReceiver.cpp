@@ -190,17 +190,5 @@ namespace abt::comm::simple_pipe::test::receiver
 
             Assert::IsTrue(std::equal(expected.begin(), expected.end(), acutals.begin(), acutals.end()));
         }
-
-        //バッファーサイズが上限より大きい場合に例外
-        TEST_METHOD(TooLongPacket)
-        {
-            auto packet = CreatePacket<10>(L"FGHIJKLMNO");
-            Receiver receiver(4, [&](const auto p, auto s) {
-                Assert::Fail();
-            });
-
-            Assert::ExpectException<std::length_error>([&]() {receiver.Feed(&packet, packet.size); });
-        }
-
     };
 }

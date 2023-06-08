@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <windows.h>
+#include <limits>
 #include <memory>
 #include <functional>
 #include <optional>
@@ -74,7 +75,6 @@ namespace abt::comm::simple_pipe
             StateBase(Receiver* owner) : owner(owner) {}
 
         protected:
-            inline size_t LimitSize() const { return owner->limitSize; }
             inline std::vector<BYTE>& Pool() { return owner->pool; }
 
             inline Idle& Idle() { return owner->idle; }
@@ -102,9 +102,6 @@ namespace abt::comm::simple_pipe
                     return {&Insufficient(), Buffer(buffer.End(),0)};
                 }
                 const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
-                if (packet->size > LimitSize()) {
-                    throw std::length_error("packet size is too long");
-                }
                 if (packet->size > buffer.Size()) {
                     //パケットサイズが受信バッファー残サイズより大きい場合
                     // Continuationをセットアップして続きは次回以降に取得
@@ -196,9 +193,6 @@ namespace abt::comm::simple_pipe
                     return { this, Buffer(buffer.End(),0) };
                 }
                 const Packet* packet = reinterpret_cast<const Packet*>(&Pool()[0]);
-                if (packet->size > LimitSize()) {
-                    throw std::length_error("packet size is too long");
-                }
                 const DWORD remain = packet->size - prevSize;
                 if (remain > buffer.Size() ) {
                     //パケットサイズが受信バッファー残サイズより大きい場合
@@ -212,9 +206,6 @@ namespace abt::comm::simple_pipe
             }
 
         };
-
-        //パケットサイズ上限
-        const size_t limitSize;
 
         //受信バッファーをまたいだ場合の一時保存領域
         std::vector<BYTE> pool;
@@ -237,17 +228,16 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// コンストラクタ
         /// </summary>
-        /// <param name="limitSize">受信サイズ上限</param>
+        /// <param name="reserveSize">受信バッファー初期リザーブサイズ</param>
         /// <param name="callback">受信コールバック</param>
-        Receiver(size_t limitSize, ReceivedCallback callback)
-            : limitSize(limitSize)
-            , callback(callback)
+        Receiver(size_t reserveSize, ReceivedCallback callback)
+            : callback(callback)
             , idle(this)
             , continuation(this)
             , insufficient(this)
             , state(&idle)
         {
-            pool.reserve(limitSize);
+            pool.reserve(reserveSize);
         }
 
         /// <summary>
@@ -279,8 +269,12 @@ namespace abt::comm::simple_pipe
     };
 #pragma endregion
 
-    //バッファーサイズ
+    //推奨バッファーサイズ
     constexpr DWORD TYPICAL_BUFFER_SIZE = 64 * 1024;
+
+    //最少バッファーサイズ
+    constexpr DWORD MIN_BUFFER_SIZE = 40;
+
 
     /// <summary>
     /// イベント種別
@@ -327,12 +321,20 @@ namespace abt::comm::simple_pipe
         winrt::handle readEvent;
         //受信パケット処理
         std::unique_ptr<Receiver> receiver;
-        //送信バッファー
-        std::unique_ptr<BYTE[]> writeBuffer;
         //送信バッファー利用可イベント
         std::unique_ptr<concurrency::event> writableEvent;
         //クローズ中フラグ
-        bool closing;
+        LONG closing;
+
+        bool TestClosing()
+        {
+            return 1 == InterlockedCompareExchange(&closing, 1, 1);
+        }
+
+        bool SetClosing()
+        {
+            return 1 == InterlockedCompareExchange(&closing, 1, 0);
+        }
 
         struct Defer {
             std::function<void(void)> func;
@@ -341,11 +343,84 @@ namespace abt::comm::simple_pipe
             void Detach() { func = std::function<void(void)>(); }
         };
 
+        struct WriteOverlapTag {
+            SimpleNamedPipeBase* owner;
+            LPCVOID buffer;
+            DWORD remain;
+            DWORD lastErr;
+            bool success;
+            bool completed;
+        };
+
+        static void WriteOverlapComplete(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
+        {
+            WriteOverlapTag* tag = reinterpret_cast<WriteOverlapTag*>(lpOverlapped->hEvent);
+            tag->lastErr = dwErrorCode;
+            if (ERROR_SUCCESS != dwErrorCode) {
+                tag->success = false;
+                return;
+            }
+            DWORD remain = tag->remain - dwNumberOfBytesTransfered;
+            if (0 > remain) {
+                tag->success = false;
+                return;
+            }
+            tag->remain = remain;
+            tag->completed = tag->remain == 0;
+            tag->buffer = reinterpret_cast<const BYTE*>(tag->buffer) + dwNumberOfBytesTransfered;
+            tag->success = true;
+            return;
+        }
+
+        void WriteRaw(LPCVOID buffer, DWORD size, concurrency::cancellation_token ct)
+        {
+            winrt::handle cancelEvent{CreateEvent(nullptr, true, false, nullptr)};
+            concurrency::cancellation_token_registration cookie;
+            if (ct.is_cancelable()) {
+                //キャンセル可能な場合のイベントディスパッチ処理
+                cookie = ct.register_callback([&cancelEvent, ct, &cookie]() {
+                    winrt::check_bool(SetEvent(cancelEvent.get()));
+                    try {
+                        ct.deregister_callback(cookie);
+                    }
+                    catch (...) {}
+                });
+            }
+            //オーバーラップ構造体の設定
+            WriteOverlapTag tag{ this, buffer, size, ERROR_SUCCESS, true, false };
+            while (!tag.completed && tag.remain > 0) {
+                OVERLAPPED overlapped = { 0 };
+                overlapped.hEvent = reinterpret_cast<HANDLE>(&tag);
+                winrt::check_bool(WriteFileEx(handlePipe.get(), tag.buffer, tag.remain, &overlapped, &SimpleNamedPipeBase::WriteOverlapComplete));
+                auto res = WaitForSingleObjectEx(cancelEvent.get(), INFINITE, true);
+                if (WAIT_OBJECT_0 == res) {
+                    //非同期送信をキャンセル
+                    CancelIoEx(handlePipe.get(), &overlapped);
+                    concurrency::cancel_current_task();
+                    break;
+                }
+                else if (WAIT_IO_COMPLETION == res) {
+                    if (!tag.success) {
+                        if (ERROR_SUCCESS != tag.lastErr) {
+                            winrt::throw_hresult(HRESULT_FROM_WIN32(tag.lastErr));
+                        }
+                        throw std::logic_error("WriteRaw logic error");
+                    }
+                }
+                else {
+                    winrt::throw_last_error();
+                }
+            }
+            if (ct.is_cancelable()) {
+                ct.deregister_callback(cookie);
+            }
+        }
+
     public:
         //送信・受信バッファーサイズ
         inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
         //1回の送信・受信の最大サイズ
-        inline static constexpr DWORD MAX_DATA_SIZE = BUFFER_SIZE - static_cast<DWORD>(sizeof DWORD);
+        inline static constexpr size_t MAX_DATA_SIZE = (std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD);
 
         SimpleNamedPipeBase() = default;
         SimpleNamedPipeBase(SimpleNamedPipeBase&&) = default;
@@ -364,11 +439,10 @@ namespace abt::comm::simple_pipe
             , readOverlap({ 0 })
             , readBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
             , receiver(std::make_unique<Receiver>(BUF_SIZE, receivedCallback))
-            , writeBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
             , writableEvent(std::make_unique<concurrency::event>())
-            , closing(false)
+            , closing(0)
         {
-            if constexpr(BUF_SIZE <= sizeof(Packet::size)) {
+            if constexpr(BUF_SIZE < MIN_BUFFER_SIZE) {
                 throw std::invalid_argument("BUF_SIZE is too short");
             }
             readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
@@ -415,7 +489,7 @@ namespace abt::comm::simple_pipe
             }
             if (ERROR_IO_PENDING != lastErr) {
                 //I/O完了待ち以外ではエラー
-                if (!closing) {
+                if (!TestClosing()) {
                     winrt::throw_last_error();
                 }
                 //クローズ中は例外を送出せずに切断状態を返す
@@ -444,7 +518,7 @@ namespace abt::comm::simple_pipe
                     return false;
                 }
                 //クローズ中のエラーは無視
-                if (!closing) {
+                if (!TestClosing()) {
                     winrt::throw_last_error();
                 }
                 return false;
@@ -470,45 +544,6 @@ namespace abt::comm::simple_pipe
         }
 
         /// <summary>
-        /// 書き込み完了待ち
-        /// </summary>
-        /// <param name="aquireLock">true:完了時点で書き込みロックを取得</param>
-        /// <param name="ct">キャンセルトークン</param>
-        /// <param name="timeout">タイムアウト(defalut:タイムアウトしない)</param>
-        /// <returns>非同期オブジェクト</returns>
-        concurrency::task<void> WaitWriteComplete(bool aquireLock, concurrency::cancellation_token ct, unsigned int timeout = concurrency::COOPERATIVE_TIMEOUT_INFINITE)
-        {
-            return concurrency::create_task([this, aquireLock, timeout, ct] {
-                std::vector<concurrency::event*> events;
-                concurrency::event cancelEvent;
-                if (ct.is_cancelable()) {
-                    concurrency::cancellation_token_registration cookie;
-                    cookie = ct.register_callback([&cancelEvent, ct, &cookie]() {
-                        cancelEvent.set();
-                        ct.deregister_callback(cookie);
-                    });
-                    events.emplace_back(&cancelEvent);
-                }
-                events.emplace_back(writableEvent.get());
-                auto res = concurrency::event::wait_for_multiple(&events[0], events.size(), false, timeout);
-                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == res) {
-                    //タイムアウト
-                    throw concurrency::task_canceled("timeout");
-                }
-                if (0 <= res && res < events.size()) {
-                    if (events[res] == &cancelEvent) {
-                        concurrency::cancel_current_task();
-                    }
-                    if (events[res] == writableEvent.get()) {
-                        if (aquireLock) {
-                            writableEvent->reset();
-                        }
-                    }
-                }
-            }, concurrency::task_options(ct));
-        }
-
-        /// <summary>
         /// 非同期送信処理
         /// </summary>
         /// <param name="buffer">送信バッファー</param>
@@ -525,81 +560,29 @@ namespace abt::comm::simple_pipe
             if (size > MAX_DATA_SIZE ) {
                 throw std::length_error("size is too long");
             }
-
-            if (ct.is_canceled()) {
-                throw concurrency::task_canceled();
-            }
-
-            //書き込み中ならば書き込み完了まで待って書き込みロックを取得
-            WaitWriteComplete(true, ct).wait();
-            //同期的に書き込み完了した際にイベントセットする
-            Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
-
-            //送信完了イベント
-            winrt::handle writeEvent{CreateEventW(nullptr, true, false, nullptr)};
-            winrt::check_bool(static_cast<bool>(writeEvent));
-
-            //送信バッファーへコピー
-            auto packet = reinterpret_cast<Packet*>(writeBuffer.get());
-            packet->size = static_cast<DWORD>(size + sizeof(Packet::size));
-            memcpy(packet->data, buffer, size);
-
-            //オーバーラップ構造体の設定
-            OVERLAPPED overlapped = { 0 };
-            overlapped.hEvent = writeEvent.get();
-            //非同期送信
-            if (WriteFile(handlePipe.get(), writeBuffer.get(), static_cast<DWORD>(packet->size), nullptr, &overlapped)) {
-                //同期で処理完了
-                return concurrency::task_from_result();
-            }
-            auto lastErr = GetLastError();
-            if (ERROR_IO_PENDING != lastErr) {
-                //完了待ち以外ではエラー
-                winrt::throw_last_error();
-            }
-
-            //タスクへ引き継ぐために同期オブジェクトはデタッチして変更されないようにする
-            writeEvent.detach();
-            defer.Detach();
+            auto writeSize = static_cast<DWORD>(size);
 
             //非同期時の送信完了待機のタスク
-            return concurrency::create_task([this, overlapped, ct]() {
-                //タスクから抜けた際に書き込み可能イベントをセット
-                Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
-                std::vector<HANDLE> handles;
-                //非同期書き込みイベントを終了時に開放するようにしておく
-                winrt::handle writeEvent(overlapped.hEvent);
-                winrt::handle cancelEvent;
-                if (ct.is_cancelable()) {
-                    //キャンセル可能な場合のイベントディスパッチ処理
-                    cancelEvent.attach(CreateEventW(nullptr, true, false, nullptr));
-                    winrt::check_bool(static_cast<bool>(cancelEvent));
-                    concurrency::cancellation_token_registration cookie;
-                    cookie = ct.register_callback([&cancelEvent, ct, &cookie]() {
-                        winrt::check_bool(SetEvent(cancelEvent.get()));
-                        ct.deregister_callback(cookie);
-                        });
-                    handles.emplace_back(cancelEvent.get());
-                }
-                handles.emplace_back(writeEvent.get());
+            return concurrency::create_task([this, buffer, writeSize, ct]() {
+                //同期的に書き込み完了した際にイベントセットする
+                Defer defer([this] {if (this->writableEvent) this->writableEvent->set(); });
 
-                //書き込み完了、もしくは中断まで待機
-                auto res = WaitForMultipleObjects(static_cast<DWORD>(handles.size()), &handles[0], false, INFINITE);
-                auto index = res - WAIT_OBJECT_0;
-                if (0 <= index && index < handles.size()) {
-                    //書き込み完了、もしくはキャンセル
-                    winrt::check_bool(ResetEvent(handles[index]));
-                    if (handles[index] == cancelEvent.get()) {
-                        //タスクキャンセル処理
-                        concurrency::cancel_current_task();
-                    }
-                }
+                auto packetSize = writeSize + static_cast<DWORD>(sizeof(DWORD));
+
+                //データサイズを送信
+                WriteRaw(&packetSize, sizeof(packetSize), ct);
+                //データ保体を送信
+                WriteRaw(buffer, writeSize, ct);
+
             }, concurrency::task_options(ct));
         }
 
         void Close()
         {
-            closing = true;
+            if (SetClosing()) {
+                //すでにclose実行済み
+                return;
+            }
             if (static_cast<bool>(handlePipe)) {
                 handlePipe.close();
             }
@@ -615,11 +598,12 @@ namespace abt::comm::simple_pipe
     public:
         using Base = SimpleNamedPipeBase<BUF_SIZE>;
         inline static constexpr DWORD BUFFER_SIZE = Base::BUFFER_SIZE;
-        inline static constexpr DWORD MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
+        inline static constexpr size_t MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
         using Callback = std::function<void(SimpleNamedPipeServer<BUF_SIZE>&, const PipeEventParam&)>;
     private:
         Base base;
 
+        const std::wstring pipeName;
         Callback callback;
         OVERLAPPED connectionOverlap;
         winrt::handle connectionEvent;
@@ -671,10 +655,19 @@ namespace abt::comm::simple_pipe
                             //切断検知
                             //切断コールバック
                             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
-                            //終了した接続の後始末をして次回接続の待機
-                            Disconnect();
-                            //次回接続待ち開始
-                            BeginConnect();
+                            try {
+                                //終了した接続の後始末をして次回接続の待機
+                                Disconnect();
+                                //次回接続待ち開始
+                                BeginConnect();
+                            }
+                            catch (winrt::hresult_error& ex) {
+                                if (ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                                    //閉じる段階でハンドルが破棄された場合
+                                    break;
+                                }
+                                throw;
+                            }
                         }
                     }
                     else {
@@ -730,7 +723,8 @@ namespace abt::comm::simple_pipe
         /// <param name="psa">セキュリティディスクリプタ</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeServer(LPCWSTR name, LPSECURITY_ATTRIBUTES psa, Callback callback)
-            : callback(callback)
+            : pipeName(name)
+            , callback(callback)
             , connectionOverlap({ 0 })
         {
             //名前付きパイプの作成
@@ -783,6 +777,8 @@ namespace abt::comm::simple_pipe
             return base.WriteAsync(buffer, size, ct);
         }
 
+        std::wstring PipeName() const { return pipeName; }
+
         bool Valid()
         {
             return base.Valid();
@@ -790,8 +786,8 @@ namespace abt::comm::simple_pipe
 
         void Close()
         {
-            winrt::check_bool(SetEvent(stopEvent.get()));
             base.Close();
+            winrt::check_bool(SetEvent(stopEvent.get()));
         }
 
         /// <summary>
@@ -828,11 +824,12 @@ namespace abt::comm::simple_pipe
     public:
         using Base = SimpleNamedPipeBase<BUF_SIZE>;
         inline static constexpr DWORD BUFFER_SIZE = Base::BUFFER_SIZE;
-        inline static constexpr DWORD MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
+        inline static constexpr size_t MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
         using Callback = std::function<void(SimpleNamedPipeClient<BUF_SIZE>&, const PipeEventParam&)>;
     private:
         Base base;
 
+        const std::wstring pipeName;
         Callback callback;
         concurrency::task<void> watcherTask;
 
@@ -898,7 +895,8 @@ namespace abt::comm::simple_pipe
         /// <param name="name">名前付きパイプ名称</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeClient(LPCWSTR name, Callback callback)
-            : callback(callback)
+            : pipeName(name)
+            , callback(callback)
         {
             winrt::check_bool(WaitNamedPipe(name, NMPWAIT_USE_DEFAULT_WAIT));
             //サーバーへ接続
@@ -937,6 +935,8 @@ namespace abt::comm::simple_pipe
         {
             return base.WriteAsync(buffer, size, ct);
         }
+
+        std::wstring PipeName() const { return pipeName; }
 
         bool Valid()
         {
