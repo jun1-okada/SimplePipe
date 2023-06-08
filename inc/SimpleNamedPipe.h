@@ -22,6 +22,7 @@ namespace abt::comm::simple_pipe
         BYTE data[1];
     };
 
+#pragma region Receiver
     /// <summary>
     /// 受信データ復号クラス
     /// </summary>
@@ -276,10 +277,10 @@ namespace abt::comm::simple_pipe
             state = &idle;
         }
     };
-
+#pragma endregion
 
     //バッファーサイズ
-    constexpr DWORD TYPICAL_BUFFER_SIZE = 2048;
+    constexpr DWORD TYPICAL_BUFFER_SIZE = 64 * 1024;
 
     /// <summary>
     /// イベント種別
@@ -330,9 +331,21 @@ namespace abt::comm::simple_pipe
         std::unique_ptr<BYTE[]> writeBuffer;
         //送信バッファー利用可イベント
         std::unique_ptr<concurrency::event> writableEvent;
+        //クローズ中フラグ
+        bool closing;
+
+        struct Defer {
+            std::function<void(void)> func;
+            Defer(std::function<void(void)> func) : func(func) {}
+            ~Defer() { if (func) func(); }
+            void Detach() { func = std::function<void(void)>(); }
+        };
 
     public:
-        static const DWORD BUFFER_SIZE = BUF_SIZE;
+        //送信・受信バッファーサイズ
+        inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
+        //1回の送信・受信の最大サイズ
+        inline static constexpr DWORD MAX_DATA_SIZE = BUFFER_SIZE - static_cast<DWORD>(sizeof DWORD);
 
         SimpleNamedPipeBase() = default;
         SimpleNamedPipeBase(SimpleNamedPipeBase&&) = default;
@@ -353,9 +366,10 @@ namespace abt::comm::simple_pipe
             , receiver(std::make_unique<Receiver>(BUF_SIZE, receivedCallback))
             , writeBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
             , writableEvent(std::make_unique<concurrency::event>())
+            , closing(false)
         {
             if constexpr(BUF_SIZE <= sizeof(Packet::size)) {
-                throw std::runtime_error("BUF_SIZE is too short");
+                throw std::invalid_argument("BUF_SIZE is too short");
             }
             readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(static_cast<bool>(readEvent));
@@ -393,13 +407,19 @@ namespace abt::comm::simple_pipe
             }
             //同期的に受信データを取得できないかエラーの場合
             auto lastErr = GetLastError();
-            if (ERROR_NO_DATA == lastErr || ERROR_BROKEN_PIPE == lastErr) {
+            if (ERROR_PIPE_NOT_CONNECTED == lastErr
+                    || ERROR_BROKEN_PIPE == lastErr
+                    || ERROR_PIPE_LISTENING == lastErr) {
                 //切断状態
                 return false;
             }
             if (ERROR_IO_PENDING != lastErr) {
                 //I/O完了待ち以外ではエラー
-                winrt::throw_last_error();
+                if (!closing) {
+                    winrt::throw_last_error();
+                }
+                //クローズ中は例外を送出せずに切断状態を返す
+                return false;
             }
             return true;
         }
@@ -417,12 +437,17 @@ namespace abt::comm::simple_pipe
                     //データ受信を完了していない
                     return true;
                 }
-                if (ERROR_NO_DATA == lastErr || ERROR_BROKEN_PIPE == lastErr) {
+                if (ERROR_PIPE_NOT_CONNECTED == lastErr
+                        || ERROR_BROKEN_PIPE == lastErr
+                        || ERROR_PIPE_LISTENING == lastErr) {
                     //切断状態
                     return false;
                 }
-                //エラー
-                winrt::throw_last_error();
+                //クローズ中のエラーは無視
+                if (!closing) {
+                    winrt::throw_last_error();
+                }
+                return false;
             }
             //データ受信
             receiver->Feed(readBuffer.get(), readSize);
@@ -444,12 +469,44 @@ namespace abt::comm::simple_pipe
             return connected;
         }
 
-        struct Defer {
-            std::function<void(void)> func;
-            Defer(std::function<void(void)> func) : func(func) {}
-            ~Defer() { if(func) func(); }
-            void Detach() { func = std::function<void(void)>(); }
-        };
+        /// <summary>
+        /// 書き込み完了待ち
+        /// </summary>
+        /// <param name="aquireLock">true:完了時点で書き込みロックを取得</param>
+        /// <param name="ct">キャンセルトークン</param>
+        /// <param name="timeout">タイムアウト(defalut:タイムアウトしない)</param>
+        /// <returns>非同期オブジェクト</returns>
+        concurrency::task<void> WaitWriteComplete(bool aquireLock, concurrency::cancellation_token ct, unsigned int timeout = concurrency::COOPERATIVE_TIMEOUT_INFINITE)
+        {
+            return concurrency::create_task([this, aquireLock, timeout, ct] {
+                std::vector<concurrency::event*> events;
+                concurrency::event cancelEvent;
+                if (ct.is_cancelable()) {
+                    concurrency::cancellation_token_registration cookie;
+                    cookie = ct.register_callback([&cancelEvent, ct, &cookie]() {
+                        cancelEvent.set();
+                        ct.deregister_callback(cookie);
+                    });
+                    events.emplace_back(&cancelEvent);
+                }
+                events.emplace_back(writableEvent.get());
+                auto res = concurrency::event::wait_for_multiple(&events[0], events.size(), false, timeout);
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == res) {
+                    //タイムアウト
+                    throw concurrency::task_canceled("timeout");
+                }
+                if (0 <= res && res < events.size()) {
+                    if (events[res] == &cancelEvent) {
+                        concurrency::cancel_current_task();
+                    }
+                    if (events[res] == writableEvent.get()) {
+                        if (aquireLock) {
+                            writableEvent->reset();
+                        }
+                    }
+                }
+            }, concurrency::task_options(ct));
+        }
 
         /// <summary>
         /// 非同期送信処理
@@ -458,22 +515,23 @@ namespace abt::comm::simple_pipe
         /// <param name="size">送信サイズ</param>
         /// <param name="ct">キャンセルトークン</param>
         /// <returns>非同期タスク</returns>
-        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct)
+        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
             if (!static_cast<bool>(handlePipe)) {
                 //handleが無効
                 throw std::runtime_error("this instance is invalid");
             }
 
-            if (size > BUF_SIZE - sizeof(Packet::size) ) {
-                //バッファーサイズより大きい場合はエラー
+            if (size > MAX_DATA_SIZE ) {
                 throw std::length_error("size is too long");
             }
 
-            //書き込み中ならば待ち
-            writableEvent->wait();
-            //書込み可能イベントリセット
-            writableEvent->reset();
+            if (ct.is_canceled()) {
+                throw concurrency::task_canceled();
+            }
+
+            //書き込み中ならば書き込み完了まで待って書き込みロックを取得
+            WaitWriteComplete(true, ct).wait();
             //同期的に書き込み完了した際にイベントセットする
             Defer defer([this] {if(this->writableEvent) this->writableEvent->set(); });
 
@@ -518,7 +576,7 @@ namespace abt::comm::simple_pipe
                     winrt::check_bool(static_cast<bool>(cancelEvent));
                     concurrency::cancellation_token_registration cookie;
                     cookie = ct.register_callback([&cancelEvent, ct, &cookie]() {
-                        SetEvent(cancelEvent.get());
+                        winrt::check_bool(SetEvent(cancelEvent.get()));
                         ct.deregister_callback(cookie);
                         });
                     handles.emplace_back(cancelEvent.get());
@@ -530,13 +588,18 @@ namespace abt::comm::simple_pipe
                 auto index = res - WAIT_OBJECT_0;
                 if (0 <= index && index < handles.size()) {
                     //書き込み完了、もしくはキャンセル
-                    ResetEvent(handles[index]);
+                    winrt::check_bool(ResetEvent(handles[index]));
+                    if (handles[index] == cancelEvent.get()) {
+                        //タスクキャンセル処理
+                        concurrency::cancel_current_task();
+                    }
                 }
             }, concurrency::task_options(ct));
         }
 
         void Close()
         {
+            closing = true;
             if (static_cast<bool>(handlePipe)) {
                 handlePipe.close();
             }
@@ -550,15 +613,17 @@ namespace abt::comm::simple_pipe
     class SimpleNamedPipeServer
     {
     public:
-        static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
+        using Base = SimpleNamedPipeBase<BUF_SIZE>;
+        inline static constexpr DWORD BUFFER_SIZE = Base::BUFFER_SIZE;
+        inline static constexpr DWORD MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
         using Callback = std::function<void(SimpleNamedPipeServer<BUF_SIZE>&, const PipeEventParam&)>;
     private:
-        using Base = SimpleNamedPipeBase<BUF_SIZE>;
         Base base;
 
         Callback callback;
         OVERLAPPED connectionOverlap;
         winrt::handle connectionEvent;
+        winrt::handle stopEvent;
         concurrency::task<void> watcherTask;
 
         void Received(LPCVOID buffer, size_t size)
@@ -575,7 +640,7 @@ namespace abt::comm::simple_pipe
             return concurrency::create_task([this]() {
                 while (true) {
                     //接続、受信イベントを監視
-                    const HANDLE handles[]{ connectionEvent.get(), base.ReadEvent().get() };
+                    const HANDLE handles[]{ stopEvent.get(), connectionEvent.get(), base.ReadEvent().get() };
                     auto res = WaitForMultipleObjects(_countof(handles), handles, false, INFINITE);
                     if (res == WAIT_FAILED) {
                         //エラー
@@ -588,8 +653,11 @@ namespace abt::comm::simple_pipe
                     auto index = res - WAIT_OBJECT_0;
                     if (0 <= index && index < _countof(handles)) {
                         bool connected = false;
-                        ResetEvent(handles[index]);
-                        if (connectionEvent.get() == handles[index]) {
+                        winrt::check_bool(ResetEvent(handles[index]));
+                        if (stopEvent.get() == handles[index]) {
+                            //停止イベント
+                            break;
+                        } else if (connectionEvent.get() == handles[index]) {
                             //非同期受信処理開始
                             connected = base.OverappedRead();
                             //接続イベント
@@ -604,8 +672,7 @@ namespace abt::comm::simple_pipe
                             //切断コールバック
                             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
                             //終了した接続の後始末をして次回接続の待機
-                            winrt::check_bool(DisconnectNamedPipe(base.Handle()));
-                            BeginConnect();
+                            Disconnect();
                         }
                     }
                     else {
@@ -628,7 +695,9 @@ namespace abt::comm::simple_pipe
         {
             if (!ConnectNamedPipe(base.Handle(), &connectionOverlap)) {
                 auto lastErr = GetLastError();
-                if (ERROR_PIPE_LISTENING != lastErr && ERROR_IO_PENDING != lastErr && ERROR_PIPE_CONNECTED != lastErr) {
+                if (ERROR_PIPE_LISTENING != lastErr
+                        && ERROR_IO_PENDING != lastErr
+                        && ERROR_PIPE_CONNECTED != lastErr) {
                     //ペンディングではない場合の名前付きパイプ接続失敗
                     winrt::throw_last_error();
                 }
@@ -668,7 +737,7 @@ namespace abt::comm::simple_pipe
                 CreateNamedPipeW(
                     name,
                     PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     BUF_SIZE,
                     BUF_SIZE,
@@ -687,6 +756,10 @@ namespace abt::comm::simple_pipe
             //接続用オーバーラップ構造体の初期化
             connectionOverlap.hEvent = connectionEvent.get();
 
+            //停止イベント作成
+            stopEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
+            winrt::check_bool(static_cast<bool>(stopEvent));
+
             //接続待ち開始
             BeginConnect();
 
@@ -703,7 +776,7 @@ namespace abt::comm::simple_pipe
                 });
         }
 
-        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct)
+        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
             return base.WriteAsync(buffer, size, ct);
         }
@@ -715,11 +788,26 @@ namespace abt::comm::simple_pipe
 
         void Close()
         {
+            winrt::check_bool(SetEvent(stopEvent.get()));
             base.Close();
+        }
+
+        /// <summary>
+        /// 接続中のClientを切断する
+        /// </summary>
+        virtual void Disconnect()
+        {
+            FlushFileBuffers(base.Handle());
+            winrt::check_bool(DisconnectNamedPipe(base.Handle()));
+            //次回接続待ち開始
+            BeginConnect();
         }
 
         virtual ~SimpleNamedPipeServer()
         {
+            Close();
+            try { watcherTask.wait(); }
+            catch (...) {};
         }
     };
 
@@ -732,10 +820,11 @@ namespace abt::comm::simple_pipe
     class SimpleNamedPipeClient
     {
     public:
-        static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
+        using Base = SimpleNamedPipeBase<BUF_SIZE>;
+        inline static constexpr DWORD BUFFER_SIZE = Base::BUFFER_SIZE;
+        inline static constexpr DWORD MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
         using Callback = std::function<void(SimpleNamedPipeClient<BUF_SIZE>&, const PipeEventParam&)>;
     private:
-        using Base = SimpleNamedPipeBase<BUF_SIZE>;
         Base base;
 
         Callback callback;
@@ -766,12 +855,13 @@ namespace abt::comm::simple_pipe
                     }
                     auto index = res - WAIT_OBJECT_0;
                     if (0 <= index && index < _countof(handles)) {
-                        ResetEvent(handles[index]);
+                        winrt::check_bool(ResetEvent(handles[index]));
                         if (base.ReadEvent().get() == handles[index]) {
                             //読み込みイベント
                             if (!base.OnSignalRead()) {
                                 //切断状態の場合
                                 callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
+                                break;
                             }
                         }
                     }
@@ -804,6 +894,7 @@ namespace abt::comm::simple_pipe
         SimpleNamedPipeClient(LPCWSTR name, Callback callback)
             : callback(callback)
         {
+            winrt::check_bool(WaitNamedPipe(name, NMPWAIT_USE_DEFAULT_WAIT));
             //サーバーへ接続
             winrt::file_handle handlePipe(CreateFileW(
                 name,
@@ -820,6 +911,9 @@ namespace abt::comm::simple_pipe
             //ベース処理の以上用クラスを作成
             base = Base(std::move(handlePipe), std::bind(&SimpleNamedPipeClient::Received, this, std::placeholders::_1, std::placeholders::_2));
 
+            //非同期受信処理開始
+            base.OverappedRead();
+
             //監視タスク開始
             watcherTask = WatchAsync().then([this](concurrency::task<void> prevTask) {
                 try {
@@ -831,11 +925,9 @@ namespace abt::comm::simple_pipe
                     this->callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, prevTask });
                 }
                 });
-            //非同期受信処理開始
-            base.OverappedRead();
         }
 
-        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct)
+        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
             return base.WriteAsync(buffer, size, ct);
         }
@@ -847,11 +939,16 @@ namespace abt::comm::simple_pipe
 
         void Close()
         {
+            FlushFileBuffers(base.Handle());
             base.Close();
         }
 
         virtual ~SimpleNamedPipeClient()
         {
+            //監視タスク終了待ち（例外は無視）
+            Close();
+            try { watcherTask.wait();}
+            catch (...) {};
         }
     };
 

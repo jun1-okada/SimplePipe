@@ -9,7 +9,7 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 * Windows10 以降に対応。レガシー環境は考慮していない。
 * *winrt*, *ppl* に依存。
 * 非同期処理に対応。というか、非同期オンリー。
-* 1件あたり数KBの少量のデータ通信を想定している。
+* 1件あたり数十KBの少量のデータ通信を想定している。（推奨サイズは64KB）
 
 # 使い方
 ヘッダーファイル `SimpleNamedPipe.h` をinclude する。
@@ -64,7 +64,7 @@ SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const a
 ## クライアント
 `SimpleNamedPipeClient<BUF_SIZE>` でクライアントインスタンスを生成する。
 
-`BUF_SIZE` は通信パケットサイズを指定する。ヘッダー領域として4byte消費するので、4より大きい値を指定すること。4以下の場合は `std::runtime_error` が発生する。
+`BUF_SIZE` は通信パケットサイズを指定する。ヘッダー領域として4byte消費するので、4より大きい値を指定すること。4以下の場合は `std::invalid_argument` が発生する。
 
 上記の通り4byteをヘッダー領域として利用するため、実際に利用可能なサイズは `BUF_SIZE - 4byte` となる。
 

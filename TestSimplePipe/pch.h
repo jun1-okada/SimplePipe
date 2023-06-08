@@ -8,5 +8,8 @@
 #define PCH_H
 
 // プリコンパイルするヘッダーをここに追加します
+#pragma once
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 
 #endif //PCH_H
