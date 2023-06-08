@@ -106,7 +106,7 @@ namespace abt::comm::simple_pipe::test
             Assert::AreEqual(std::wstring(L"echo: HELLO WORLD!"), echoMessage);
         }
 
-        TEST_METHOD(Hello1000times)
+        void HelloNtimes(const ULONG repeat)
         {
             auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
 
@@ -138,8 +138,7 @@ namespace abt::comm::simple_pipe::test
                 }
             });
 
-            constexpr ULONG REPEAT = 1000;
-            auto remain = REPEAT;
+            auto remain = repeat;
 
             std::vector<std::wstring> actualValues;
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
@@ -169,7 +168,7 @@ namespace abt::comm::simple_pipe::test
 
 
             std::vector<std::wstring> expectedValues;
-            for (int i = 0; i < REPEAT; ++i) {
+            for (int i = 0; i < repeat; ++i) {
                 std::wstringstream oss;
                 oss << L"HELLO WORLD![" << i << "]";
                 auto message = oss.str();
@@ -195,7 +194,20 @@ namespace abt::comm::simple_pipe::test
             Assert::IsTrue(std::equal(expectedValues.begin(), expectedValues.end(), actualValues.begin(), actualValues.end()));
         }
 
-        TEST_METHOD(Connect1000times)
+        BEGIN_TEST_METHOD_ATTRIBUTE(Hello1000times)
+            TEST_PRIORITY(2)
+        END_TEST_METHOD_ATTRIBUTE()
+        TEST_METHOD(Hello1000times)
+        {
+            HelloNtimes(1000);
+        }
+
+        TEST_METHOD(Hello3times)
+        {
+            HelloNtimes(3);
+        }
+
+        void ConnectNtimes(const ULONG repeat)
         {
             auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
 
@@ -230,7 +242,7 @@ namespace abt::comm::simple_pipe::test
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
             std::wstring echoMessage;
-            for (auto i = 0; i < 1000; ++i) {
+            for (auto i = 0; i < repeat; ++i) {
                 TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                     switch (param.type) {
                     case PipeEventType::DISCONNECTED:
@@ -285,6 +297,19 @@ namespace abt::comm::simple_pipe::test
             }
 
             server.Close();
+        }
+
+        BEGIN_TEST_METHOD_ATTRIBUTE(Connect1000times)
+            TEST_PRIORITY(2)
+        END_TEST_METHOD_ATTRIBUTE()
+        TEST_METHOD(Connect1000times)
+        {
+            ConnectNtimes(1000);
+        }
+
+        TEST_METHOD(Connect3times)
+        {
+            ConnectNtimes(3);
         }
 
         TEST_METHOD(DiconnectByServer)

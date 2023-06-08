@@ -369,7 +369,7 @@ namespace abt::comm::simple_pipe
             , closing(false)
         {
             if constexpr(BUF_SIZE <= sizeof(Packet::size)) {
-                throw std::runtime_error("BUF_SIZE is too short");
+                throw std::invalid_argument("BUF_SIZE is too short");
             }
             readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(static_cast<bool>(readEvent));
