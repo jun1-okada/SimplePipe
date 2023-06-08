@@ -85,7 +85,7 @@ int main()
         //例外の詳細はex.code() でHRESULT型に変換されたWindowsシステムエラーコードを取得する
         // エラーコードの詳細は以下のページを参照
         // https://learn.microsoft.com/en-us/windows/win32/api/winerror/nf-winerror-hresult_from_win32
-        // https://learn.microsoft.com/ja-jp/windows/win32/debug/system-error-codes--0-499-
+        // https://learn.microsoft.com/ja-jp/windows/win32/debug/system-error-codes#system-error-codes
         if (ex.code() == HRESULT_FROM_WIN32(ERROR_PIPE_BUSY)) {
             std::wcerr << L"既に実行中のサーバーが存在します: " << PIPE_NAME << std::endl;
         }

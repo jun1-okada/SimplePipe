@@ -9,7 +9,6 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 * Windows10 以降に対応。レガシー環境は考慮していない。
 * *winrt*, *ppl* に依存。
 * 非同期処理に対応。というか、非同期オンリー。
-* 1件あたり数十KBの少量のデータ通信を想定している。（推奨サイズは64KB）
 
 # 使い方
 ヘッダーファイル `SimpleNamedPipe.h` をinclude する。
@@ -17,13 +16,13 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 ## サーバー
 `SimpleNamedPipeServer<BUF_SIZE>` でサーバーインスタンスを生成する。
 
-`BUF_SIZE` は通信パケットサイズを指定する。ヘッダー領域として4byte消費するので、4より大きい値を指定すること。4以下の場合は `std::runtime_error` が発生する。
+`BUF_SIZE` は通信バッファーサイズを指定する。
 
-上記の通り4byteをヘッダー領域として利用するため、実際に利用可能なサイズは `BUF_SIZE - 4byte` となる。
+`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合は、`std::invalid_argument` が発生する。
 
 第2引数に `LPSECURITY_ATTRIBUTES` を指定可能。nullptr時は既定のセキュリティ記述子となる。
 
-`TypicalSimpleNamedPipeServer` は `SimpleNamedPipeServer<2048>` のエイリアスとして定義している。
+`TypicalSimpleNamedPipeServer` は `SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。これの使用を推奨する。
 
 ```cpp
 SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const auto& param) {
@@ -64,11 +63,11 @@ SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const a
 ## クライアント
 `SimpleNamedPipeClient<BUF_SIZE>` でクライアントインスタンスを生成する。
 
-`BUF_SIZE` は通信パケットサイズを指定する。ヘッダー領域として4byte消費するので、4より大きい値を指定すること。4以下の場合は `std::invalid_argument` が発生する。
+`BUF_SIZE` は通信バッファーサイズを指定する。
 
-上記の通り4byteをヘッダー領域として利用するため、実際に利用可能なサイズは `BUF_SIZE - 4byte` となる。
+`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合は、`std::invalid_argument` が発生する。
 
-`TypicalSimpleNamedPipeClient` は `SimpleNamedPipeClient<2048>` のエイリアスとして定義している。
+`TypicalSimpleNamedPipeClient` は `SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。これの使用を推奨する。
 
 ```cpp
 SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) {
@@ -105,8 +104,6 @@ SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) 
 ```
 # 利用上の注意点
 
-## テンプレート引数 BUF_SIZE について
-テンプレート引数の `BUF_SIZE` はサーバー、クライアント双方で同じ値としてください。異なった値を設定すると受信時に `std::length_error` が発生します。
 
 ## 受信バッファーについて
 イベントコールバックの受信バッファーはコールバック中の間だけしか値の保証をしない。
@@ -114,9 +111,15 @@ SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) 
 そのため、継続して受信バッファーの内容を利用する場合はコピーする必要がある。
 
 ## 送信データについて
-`BUF_SIZE - 4byte` が `WriteAsync` 実行時の送信サイズ上限になる。この上限を超えた場合は、`std::length_error` を送出する。
+`WriteAsync`メンバー関数でデータを通信相手に送信する。
 
-非同期で動作するため戻り値として `concurrency::task<void>` を返す。 `wait` 関数で同期的に待機する、`then` 関数で継続タスク中で後始末をするなどの対応が必要。
+送信データサイズは、`SimpleNamedPipeServer::MAX_DATA_SIZE`, `SimpleNamedPipeClient::MAX_DATA_SIZE` 以下に制限される。これ以上の値を指定した場合は `std::length_error` が発生する。
+
+また、上記のデータサイズ制限未満でも実行環境のメモリーリソースによっては、メモリー不足によって動作しない場合があり得る。
+
+戻り値として `concurrency::task<void>` を返す。 このタスクオブジェクトが完了状態となるまでは、引数で指定したバッファーは破棄・変更などを行わないようにする。
+
+複数のスレッドから同時に実行した場合は、各々の`WriteAsync`は独立して実行され混じることはない。ただし、データの実行順は保証しない。
 
 # 例外処理
 ## winrt::hresult_errorの注意点
@@ -162,13 +165,13 @@ catch(winrt::hresult_error& ex){
 ```
 
 ## WriteAsyncの例外
-データ送信メソッドの `WriteAsync` は非同期実行なので`concurrency::task` を返します。
+データ送信メソッドの `WriteAsync` は非同期実行なので`concurrency::task` を返す。
 
 `concurrency::task::wait` を呼び出すことで、タスクに同期しつつ例外が発生していた場合は、次の例外の再送出が行われる。
 
 * API呼び出しのエラーは `winrt::hresult_error` 
 * Closeの後に呼び出した場合は `std::runtime_error` 
-* データサイズがクラスパラメータ`BUF_SIZE - 4byte` より大きい場合は `std::length_error`
+* データサイズがクラスパラメータ`MAX_DATA_SIZE` より大きい場合は `std::length_error`
 
 ```cpp
 try{
