@@ -673,6 +673,8 @@ namespace abt::comm::simple_pipe
                             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
                             //終了した接続の後始末をして次回接続の待機
                             Disconnect();
+                            //次回接続待ち開始
+                            BeginConnect();
                         }
                     }
                     else {
@@ -798,9 +800,13 @@ namespace abt::comm::simple_pipe
         virtual void Disconnect()
         {
             FlushFileBuffers(base.Handle());
-            winrt::check_bool(DisconnectNamedPipe(base.Handle()));
-            //次回接続待ち開始
-            BeginConnect();
+            if (!DisconnectNamedPipe(base.Handle())) {
+                auto lastErr = GetLastError();
+                if (ERROR_PIPE_NOT_CONNECTED != lastErr) {
+                    //閉じられた状態のエラーは無視
+                    winrt::throw_last_error();
+                }
+            }
         }
 
         virtual ~SimpleNamedPipeServer()
