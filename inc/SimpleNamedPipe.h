@@ -12,7 +12,6 @@
 namespace abt::comm::simple_pipe
 {
     using ReceivedCallback = std::function<void(LPCVOID, size_t)>;
-
     /// <summary>
     /// データパケット
     /// </summary>
@@ -22,7 +21,6 @@ namespace abt::comm::simple_pipe
         alignas(4) DWORD size;
         BYTE data[1];
     };
-
 #pragma region Receiver
     /// <summary>
     /// 受信データ復号クラス
@@ -43,7 +41,6 @@ namespace abt::comm::simple_pipe
                 : sp(reinterpret_cast<const BYTE*>(buffer))
                 , ep(reinterpret_cast<const BYTE*>(buffer) + size)
             {}
-
             const BYTE* Start() const { return sp; }
             const BYTE* End() const { return ep; }
             bool Empty() const { return sp == ep; }
@@ -271,10 +268,8 @@ namespace abt::comm::simple_pipe
 
     //推奨バッファーサイズ
     constexpr DWORD TYPICAL_BUFFER_SIZE = 64 * 1024;
-
     //最少バッファーサイズ
     constexpr DWORD MIN_BUFFER_SIZE = 40;
-
 
     /// <summary>
     /// イベント種別
@@ -304,6 +299,16 @@ namespace abt::comm::simple_pipe
         const std::optional<concurrency::task<void>> errTask;
     };
 
+    class Flag
+    {
+    private:
+        LONG flag;
+    public:
+        Flag() : flag(0) {}
+        inline bool Test() { return 1 == InterlockedCompareExchange(&flag, 1, 1); }
+        inline bool Set() { return 1 == InterlockedCompareExchange(&flag, 1, 0); }
+    };
+
     /// <summary>
     /// 名前付きパイプ共通ベースクラス
     /// </summary>
@@ -321,20 +326,10 @@ namespace abt::comm::simple_pipe
         winrt::handle readEvent;
         //受信パケット処理
         std::unique_ptr<Receiver> receiver;
-        //送信バッファー利用可イベント
-        std::unique_ptr<concurrency::event> writableEvent;
+        //送信バッファーロック
+        concurrency::critical_section writeCs;
         //クローズ中フラグ
-        LONG closing;
-
-        bool TestClosing()
-        {
-            return 1 == InterlockedCompareExchange(&closing, 1, 1);
-        }
-
-        bool SetClosing()
-        {
-            return 1 == InterlockedCompareExchange(&closing, 1, 0);
-        }
+        Flag closing;
 
         struct Defer {
             std::function<void(void)> func;
@@ -374,7 +369,7 @@ namespace abt::comm::simple_pipe
 
         void WriteRaw(LPCVOID buffer, DWORD size, concurrency::cancellation_token ct)
         {
-            winrt::handle cancelEvent{CreateEvent(nullptr, true, false, nullptr)};
+            winrt::handle cancelEvent{CreateEventW(nullptr, true, false, nullptr)};
             concurrency::cancellation_token_registration cookie;
             if (ct.is_cancelable()) {
                 //キャンセル可能な場合のイベントディスパッチ処理
@@ -416,48 +411,78 @@ namespace abt::comm::simple_pipe
             }
         }
 
+        /// <summary>
+        /// 非同期受信完了時の処理
+        /// </summary>
+        /// <returns>false時は切断状態</returns>
+        bool OnRead()
+        {
+            DWORD readSize = 0;
+            if (!GetOverlappedResult(handlePipe.get(), &readOverlap, &readSize, FALSE)) {
+                auto lastErr = GetLastError();
+                if (lastErr == ERROR_IO_INCOMPLETE) {
+                    //データ受信を完了していない
+                    return true;
+                }
+                if (ERROR_PIPE_NOT_CONNECTED == lastErr
+                        || ERROR_BROKEN_PIPE == lastErr
+                        || ERROR_PIPE_LISTENING == lastErr) {
+                    //切断状態
+                    return false;
+                }
+                //クローズ中のエラーは無視
+                if (!closing.Test()) {
+                    winrt::throw_last_error();
+                }
+                return false;
+            }
+            //データ受信
+            receiver->Feed(readBuffer.get(), readSize);
+            return true;
+        }
+
     public:
         //送信・受信バッファーサイズ
         inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
         //1回の送信・受信の最大サイズ
         inline static constexpr size_t MAX_DATA_SIZE = (std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD);
 
-        SimpleNamedPipeBase() = default;
-        SimpleNamedPipeBase(SimpleNamedPipeBase&&) = default;
+        SimpleNamedPipeBase() = delete;
+        SimpleNamedPipeBase(SimpleNamedPipeBase&&) = delete;
         SimpleNamedPipeBase(const SimpleNamedPipeBase&) = delete;
 
-        SimpleNamedPipeBase& operator=(SimpleNamedPipeBase&&) = default;
+        SimpleNamedPipeBase& operator=(SimpleNamedPipeBase&&) = delete;
         SimpleNamedPipeBase& operator=(const SimpleNamedPipeBase&) = delete;
 
         /// <summary>
         /// コンストラクタ
         /// </summary>
-        /// <param name="handlePipe">パイプハンドル</param>
+        /// <param name="handle">パイプハンドル</param>
         /// <param name="receivedCallback">データ受信コールバック。受信データは関数呼び出し中でのみ有効。</param>
-        SimpleNamedPipeBase(winrt::file_handle&& handlePipe, ReceivedCallback receivedCallback)
-            : handlePipe(std::move(handlePipe))
+        SimpleNamedPipeBase(HANDLE handle, ReceivedCallback receivedCallback)
+            : handlePipe(handle)
             , readOverlap({ 0 })
             , readBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
             , receiver(std::make_unique<Receiver>(BUF_SIZE, receivedCallback))
-            , writableEvent(std::make_unique<concurrency::event>())
-            , closing(0)
         {
             if constexpr(BUF_SIZE < MIN_BUFFER_SIZE) {
                 throw std::invalid_argument("BUF_SIZE is too short");
             }
-            readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
+            if (!static_cast<bool>(handle)) {
+                throw std::invalid_argument("handle is invalid");
+            }
+            readEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
             winrt::check_bool(static_cast<bool>(readEvent));
             readOverlap.hEvent = readEvent.get();
-            writableEvent->set();
         }
 
         virtual ~SimpleNamedPipeBase() {}
 
-        const HANDLE Handle() { return handlePipe.get(); }
-        const bool Valid() { return static_cast<bool>(handlePipe); }
-        const std::unique_ptr<BYTE[]>& ReadBuffer() { return readBuffer; }
-        const winrt::handle& ReadEvent() { return readEvent; }
-        void Reset() { receiver->Reset(); }
+        virtual const HANDLE Handle() { return handlePipe.get(); }
+        virtual const bool Valid() { return static_cast<bool>(handlePipe); }
+        virtual const std::unique_ptr<BYTE[]>& ReadBuffer() { return readBuffer; }
+        virtual const winrt::handle& ReadEvent() { return readEvent; }
+        virtual void Reset() { receiver->Reset(); }
 
         /// <summary>
         /// 非同期受信開始
@@ -466,7 +491,6 @@ namespace abt::comm::simple_pipe
         virtual bool OverappedRead()
         {
             //受信イベントリセット
-            winrt::check_bool(ResetEvent(readEvent.get()));
             readOverlap.Offset = 0;
             readOverlap.OffsetHigh = 0;
             //受信処理
@@ -489,42 +513,12 @@ namespace abt::comm::simple_pipe
             }
             if (ERROR_IO_PENDING != lastErr) {
                 //I/O完了待ち以外ではエラー
-                if (!TestClosing()) {
+                if (!closing.Test()) {
                     winrt::throw_last_error();
                 }
                 //クローズ中は例外を送出せずに切断状態を返す
                 return false;
             }
-            return true;
-        }
-
-        /// <summary>
-        /// 非同期受信完了時の処理
-        /// </summary>
-        /// <returns>false時は切断状態</returns>
-        virtual bool OnRead()
-        {
-            DWORD readSize = 0;
-            if (!GetOverlappedResult(handlePipe.get(), &readOverlap, &readSize, FALSE)) {
-                auto lastErr = GetLastError();
-                if (lastErr == ERROR_IO_INCOMPLETE) {
-                    //データ受信を完了していない
-                    return true;
-                }
-                if (ERROR_PIPE_NOT_CONNECTED == lastErr
-                        || ERROR_BROKEN_PIPE == lastErr
-                        || ERROR_PIPE_LISTENING == lastErr) {
-                    //切断状態
-                    return false;
-                }
-                //クローズ中のエラーは無視
-                if (!TestClosing()) {
-                    winrt::throw_last_error();
-                }
-                return false;
-            }
-            //データ受信
-            receiver->Feed(readBuffer.get(), readSize);
             return true;
         }
 
@@ -550,7 +544,7 @@ namespace abt::comm::simple_pipe
         /// <param name="size">送信サイズ</param>
         /// <param name="ct">キャンセルトークン</param>
         /// <returns>非同期タスク</returns>
-        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
             if (!static_cast<bool>(handlePipe)) {
                 //handleが無効
@@ -564,26 +558,24 @@ namespace abt::comm::simple_pipe
 
             //非同期時の送信完了待機のタスク
             return concurrency::create_task([this, buffer, writeSize, ct]() {
-                //同期的に書き込み完了した際にイベントセットする
-                Defer defer([this] {if (this->writableEvent) this->writableEvent->set(); });
-
+                //書き込み出来るのは同時に１つのみ
+                concurrency::critical_section::scoped_lock lock(writeCs);
                 auto packetSize = writeSize + static_cast<DWORD>(sizeof(DWORD));
-
                 //データサイズを送信
                 WriteRaw(&packetSize, sizeof(packetSize), ct);
                 //データ保体を送信
                 WriteRaw(buffer, writeSize, ct);
-
             }, concurrency::task_options(ct));
         }
 
-        void Close()
+        virtual void Close()
         {
-            if (SetClosing()) {
+            if (closing.Set()) {
                 //すでにclose実行済み
                 return;
             }
             if (static_cast<bool>(handlePipe)) {
+                FlushFileBuffers(handlePipe.get());
                 handlePipe.close();
             }
         }
@@ -607,6 +599,7 @@ namespace abt::comm::simple_pipe
         Callback callback;
         OVERLAPPED connectionOverlap;
         winrt::handle connectionEvent;
+        winrt::handle disconnectionEvent;
         winrt::handle stopEvent;
         concurrency::task<void> watcherTask;
 
@@ -619,12 +612,12 @@ namespace abt::comm::simple_pipe
         /// イベント監視タスク
         /// </summary>
         /// <returns>非同期タスク</returns>
-        virtual concurrency::task<void> WatchAsync()
+        concurrency::task<void> WatchAsync()
         {
             return concurrency::create_task([this]() {
                 while (true) {
                     //接続、受信イベントを監視
-                    const HANDLE handles[]{ stopEvent.get(), connectionEvent.get(), base.ReadEvent().get() };
+                    const HANDLE handles[]{ stopEvent.get(), disconnectionEvent.get(), connectionEvent.get(), base.ReadEvent().get() };
                     auto res = WaitForMultipleObjects(_countof(handles), handles, false, INFINITE);
                     if (res == WAIT_FAILED) {
                         //エラー
@@ -637,12 +630,15 @@ namespace abt::comm::simple_pipe
                     auto index = res - WAIT_OBJECT_0;
                     if (0 <= index && index < _countof(handles)) {
                         bool connected = false;
-                        winrt::check_bool(ResetEvent(handles[index]));
                         if (stopEvent.get() == handles[index]) {
                             //停止イベント
                             break;
+                        } else if(disconnectionEvent.get() == handles[index]){
+                            //切断実行通知イベント
+                            connected = false;
                         } else if (connectionEvent.get() == handles[index]) {
-                            //非同期受信処理開始
+                            //クライアント接続
+                            // 非同期データ受信処理開始
                             connected = base.OverappedRead();
                             //接続イベント
                             OnConnected();
@@ -657,7 +653,7 @@ namespace abt::comm::simple_pipe
                             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
                             try {
                                 //終了した接続の後始末をして次回接続の待機
-                                Disconnect();
+                                DisconnectInner();
                                 //次回接続待ち開始
                                 BeginConnect();
                             }
@@ -679,14 +675,14 @@ namespace abt::comm::simple_pipe
                     }
                 }
                 //監視スレッド終了後はこのインスタンスは利用できない
-                Close();
+                base.Close();
                 });
         }
 
         /// <summary>
         /// 次回の接続待ち開始
         /// </summary>
-        virtual void BeginConnect()
+        void BeginConnect()
         {
             if (!ConnectNamedPipe(base.Handle(), &connectionOverlap)) {
                 auto lastErr = GetLastError();
@@ -703,9 +699,24 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// 接続時処理
         /// </summary>
-        virtual void OnConnected()
+        void OnConnected()
         {
             callback(*this, PipeEventParam{ PipeEventType::CONNECTED, nullptr, 0 });
+        }
+
+        /// <summary>
+        /// 接続中のClientを切断する
+        /// </summary>
+        void DisconnectInner()
+        {
+            FlushFileBuffers(base.Handle());
+            if (!DisconnectNamedPipe(base.Handle())) {
+                auto lastErr = GetLastError();
+                if (ERROR_PIPE_NOT_CONNECTED != lastErr) {
+                    //閉じられた状態のエラーは無視
+                    winrt::throw_last_error();
+                }
+            }
         }
 
     public:
@@ -717,41 +728,52 @@ namespace abt::comm::simple_pipe
         SimpleNamedPipeServer& operator=(const SimpleNamedPipeServer&) = delete;
 
         /// <summary>
+        /// 名前付きパイプサーバーハンドルの生成
+        /// </summary>
+        /// <param name="name">名前付きパイプ名称</param>
+        /// <param name="psa">セキュリティディスクリプタ</param>
+        /// <returns>名前付きパイプハンドル</returns>
+        static HANDLE CreateServerHandle(LPCWSTR name, LPSECURITY_ATTRIBUTES psa)
+        {
+            //名前付きパイプの作成
+            // 接続可能クライアント数=1; ローカルマシン接続のみ許可
+            HANDLE handle = CreateNamedPipeW(
+                name,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                BUF_SIZE,
+                BUF_SIZE,
+                0,
+                psa);
+
+            if (INVALID_HANDLE_VALUE == handle) {
+                winrt::throw_last_error();
+            }
+            return handle;
+        }
+
+        /// <summary>
         /// コンストラクタ
         /// </summary>
         /// <param name="name">名前付きパイプ名称</param>
         /// <param name="psa">セキュリティディスクリプタ</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeServer(LPCWSTR name, LPSECURITY_ATTRIBUTES psa, Callback callback)
-            : pipeName(name)
+            : base(CreateServerHandle(name, psa)
+                , std::bind(&SimpleNamedPipeServer::Received, this, std::placeholders::_1, std::placeholders::_2))
+            , pipeName(name)
             , callback(callback)
             , connectionOverlap({ 0 })
         {
-            //名前付きパイプの作成
-            // 接続可能クライアント数=1; ローカルマシン接続のみ許可
-            winrt::file_handle handlePipe{
-                CreateNamedPipeW(
-                    name,
-                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                    PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-                    1,
-                    BUF_SIZE,
-                    BUF_SIZE,
-                    0,
-                    psa)
-            };
-            if (!static_cast<bool>(handlePipe)) {
-                winrt::throw_last_error();
-            }
-            //ベース処理の移譲用クラスを作成
-            base = Base(std::move(handlePipe), std::bind(&SimpleNamedPipeServer::Received, this, std::placeholders::_1, std::placeholders::_2));
-
             //接続イベント作成
-            connectionEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
+            connectionEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
             winrt::check_bool(static_cast<bool>(connectionEvent));
             //接続用オーバーラップ構造体の初期化
             connectionOverlap.hEvent = connectionEvent.get();
-
+            //切断イベント作成
+            disconnectionEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
+            winrt::check_bool(static_cast<bool>(disconnectionEvent));
             //停止イベント作成
             stopEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(static_cast<bool>(stopEvent));
@@ -767,42 +789,32 @@ namespace abt::comm::simple_pipe
                 catch (...)
                 {
                     //監視タスクが例外発生で終了していた場合
+                    base.Close();
                     this->callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, prevTask });
                 }
                 });
         }
 
-        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
             return base.WriteAsync(buffer, size, ct);
         }
 
-        std::wstring PipeName() const { return pipeName; }
+        virtual std::wstring PipeName() const { return pipeName; }
 
-        bool Valid()
+        virtual bool Valid()
         {
             return base.Valid();
         }
 
-        void Close()
-        {
-            base.Close();
-            winrt::check_bool(SetEvent(stopEvent.get()));
-        }
-
-        /// <summary>
-        /// 接続中のClientを切断する
-        /// </summary>
         virtual void Disconnect()
         {
-            FlushFileBuffers(base.Handle());
-            if (!DisconnectNamedPipe(base.Handle())) {
-                auto lastErr = GetLastError();
-                if (ERROR_PIPE_NOT_CONNECTED != lastErr) {
-                    //閉じられた状態のエラーは無視
-                    winrt::throw_last_error();
-                }
-            }
+            winrt::check_bool(SetEvent(disconnectionEvent.get()));
+        }
+
+        virtual void Close()
+        {
+            winrt::check_bool(SetEvent(stopEvent.get()));
         }
 
         virtual ~SimpleNamedPipeServer()
@@ -831,6 +843,7 @@ namespace abt::comm::simple_pipe
 
         const std::wstring pipeName;
         Callback callback;
+        winrt::handle stopEvent;
         concurrency::task<void> watcherTask;
 
         void Received(LPCVOID buffer, size_t size)
@@ -842,11 +855,11 @@ namespace abt::comm::simple_pipe
         /// イベント監視タスク
         /// </summary>
         /// <returns>非同期タスク</returns>
-        virtual concurrency::task<void> WatchAsync()
+        concurrency::task<void> WatchAsync()
         {
             return concurrency::create_task([this]() {
                 while (true) {
-                    const HANDLE handles[]{ base.ReadEvent().get() };
+                    const HANDLE handles[]{ stopEvent.get(), base.ReadEvent().get() };
                     auto res = WaitForMultipleObjects(_countof(handles), handles, false, INFINITE);
                     if (res == WAIT_FAILED) {
                         //エラー
@@ -858,8 +871,11 @@ namespace abt::comm::simple_pipe
                     }
                     auto index = res - WAIT_OBJECT_0;
                     if (0 <= index && index < _countof(handles)) {
-                        winrt::check_bool(ResetEvent(handles[index]));
-                        if (base.ReadEvent().get() == handles[index]) {
+                        if (stopEvent.get() == handles[index]) {
+                            //停止イベント
+                            break;
+                        }
+                        else if (base.ReadEvent().get() == handles[index]) {
                             //読み込みイベント
                             if (!base.OnSignalRead()) {
                                 //切断状態の場合
@@ -877,7 +893,7 @@ namespace abt::comm::simple_pipe
                     }
                 }
                 //監視スレッド終了後はこのインスタンスは利用できない
-                Close();
+                base.Close();
             });
         }
 
@@ -890,30 +906,44 @@ namespace abt::comm::simple_pipe
         SimpleNamedPipeClient& operator=(SimpleNamedPipeClient&&) = delete;
 
         /// <summary>
-        /// コンストラクタ
+        /// 名前付きパイプサーバーへの接続
         /// </summary>
-        /// <param name="name">名前付きパイプ名称</param>
-        /// <param name="callback">イベント通知コールバック</param>
-        SimpleNamedPipeClient(LPCWSTR name, Callback callback)
-            : pipeName(name)
-            , callback(callback)
+        /// <param name="name">名称</param>
+        /// <returns>ハンドル</returns>
+        HANDLE OpendPipeHandle(LPCWSTR name)
         {
+            //接続可能状態まで待つ
             winrt::check_bool(WaitNamedPipe(name, NMPWAIT_USE_DEFAULT_WAIT));
             //サーバーへ接続
-            winrt::file_handle handlePipe(CreateFileW(
+            HANDLE handle = CreateFileW(
                 name,
                 GENERIC_READ | GENERIC_WRITE,
                 0,
                 nullptr,
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-                nullptr));
+                nullptr);
 
-            if (!static_cast<bool>(handlePipe)) {
+            if(INVALID_HANDLE_VALUE == handle){
                 winrt::throw_last_error();
             }
-            //ベース処理の以上用クラスを作成
-            base = Base(std::move(handlePipe), std::bind(&SimpleNamedPipeClient::Received, this, std::placeholders::_1, std::placeholders::_2));
+            return handle;
+        }
+
+        /// <summary>
+        /// コンストラクタ
+        /// </summary>
+        /// <param name="name">名前付きパイプ名称</param>
+        /// <param name="callback">イベント通知コールバック</param>
+        SimpleNamedPipeClient(LPCWSTR name, Callback callback)
+            : base(OpendPipeHandle(name)
+                , std::bind(&SimpleNamedPipeClient::Received, this, std::placeholders::_1, std::placeholders::_2))
+            , pipeName(name)
+            , callback(callback)
+        {
+            //停止イベント作成
+            stopEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
+            winrt::check_bool(static_cast<bool>(stopEvent));
 
             //非同期受信処理開始
             base.OverappedRead();
@@ -926,27 +956,27 @@ namespace abt::comm::simple_pipe
                 catch (...)
                 {
                     //監視タスクが例外発生で終了していた場合
+                    base.Close();
                     this->callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, prevTask });
                 }
                 });
         }
 
-        concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
             return base.WriteAsync(buffer, size, ct);
         }
 
         std::wstring PipeName() const { return pipeName; }
 
-        bool Valid()
+        virtual bool Valid()
         {
             return base.Valid();
         }
 
-        void Close()
+        virtual void Close()
         {
-            FlushFileBuffers(base.Handle());
-            base.Close();
+            winrt::check_bool(SetEvent(stopEvent.get()));
         }
 
         virtual ~SimpleNamedPipeClient()

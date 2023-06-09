@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <string>
 #include <sstream>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <limits>
@@ -673,6 +674,91 @@ namespace abt::comm::simple_pipe::test
 
             serverErrTask.wait();
             clientErrTask.wait();
+        }
+
+        TEST_METHOD(MultiWrite)
+        {
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event closedEvent;
+
+            TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    closedEvent.set();
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    ps.WriteAsync(param.readBuffer, param.readedSize).wait();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        serverErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            concurrency::event echoComplete;
+            std::vector<std::wstring> actual;
+
+            constexpr ULONG REPEAT = 20;
+            auto remain = REPEAT;
+
+            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::DISCONNECTED:
+                    break;
+                case PipeEventType::RECEIVED:
+                    {
+                        std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                        actual.emplace_back(m);;
+                        if (0 == InterlockedDecrement(&remain)) {
+                            echoComplete.set();
+                        }
+                    }
+                    break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        clientErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            std::vector<std::wstring> expected;
+            for (auto i = 0ul; i < REPEAT; ++i) {
+                std::wostringstream oss;
+                oss << L"HELLO WORLD! [" << std::setw(2) << i << L"]";
+                expected.emplace_back(oss.str());
+            }
+
+            concurrency::parallel_for_each(expected.begin(), expected.end(), [&](std::wstring m) {
+                client.WriteAsync(m.c_str(), m.size() * sizeof(TCHAR)).wait();
+            });
+
+            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+                Assert::Fail();
+            }
+
+            client.Close();
+            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+                Assert::Fail();
+            }
+            server.Close();
+
+            serverErrTask.wait();
+            clientErrTask.wait();
+            std::sort(actual.begin(), actual.end());
+            Assert::IsTrue(std::equal(expected.begin(), expected.end(), actual.begin(), actual.end()));
+
         }
     };
 }
