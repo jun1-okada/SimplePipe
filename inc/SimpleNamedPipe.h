@@ -1,5 +1,4 @@
 ﻿#pragma once
-
 #include <windows.h>
 #include <limits>
 #include <memory>
@@ -11,265 +10,11 @@
 
 namespace abt::comm::simple_pipe
 {
-    using ReceivedCallback = std::function<void(LPCVOID, size_t)>;
-    /// <summary>
-    /// データパケット
-    /// </summary>
-    struct Packet
-    {
-        //size分も含めた全体のサイズ
-        alignas(4) DWORD size;
-        BYTE data[1];
-    };
-#pragma region Receiver
-    /// <summary>
-    /// 受信データ復号クラス
-    /// </summary>
-    class Receiver
-    {
-    private:
-        /// <summary>
-        /// 受信バッファー管理クラス
-        /// </summary>
-        class Buffer
-        {
-        private:
-            const BYTE* sp;
-            const BYTE* ep;
-        public:
-            Buffer(LPCVOID buffer, size_t size)
-                : sp(reinterpret_cast<const BYTE*>(buffer))
-                , ep(reinterpret_cast<const BYTE*>(buffer) + size)
-            {}
-            const BYTE* Start() const { return sp; }
-            const BYTE* End() const { return ep; }
-            bool Empty() const { return sp == ep; }
-            const BYTE* Pointer() const { return sp; }
-            size_t Size() const { return std::distance(sp, ep); }
-            Buffer Consume(size_t size)
-            {
-                if (size > Size()) {
-                    throw std::length_error("size is too large");
-                }
-                auto preSp = sp;
-                sp += size;
-                return Buffer(preSp, size);
-            }
-        };
-
-        class Idle;
-        class Continuation;
-        class Insufficient;
-
-        /// <summary>
-        /// 受信ステート基底クラス
-        /// </summary>
-        class StateBase
-        {
-        protected:
-            Receiver* owner;
-            StateBase() : owner(nullptr) {}
-            StateBase(Receiver* owner) : owner(owner) {}
-
-        protected:
-            inline std::vector<BYTE>& Pool() { return owner->pool; }
-
-            inline Idle& Idle() { return owner->idle; }
-            inline Continuation& Continuation() { return owner->continuation; }
-            inline Insufficient& Insufficient() { return owner->insufficient; }
-
-        public:
-            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) = 0;
-            virtual ~StateBase() {}
-        };
-
-        /// <summary>
-        /// 連続した受信をまたがない状態
-        /// </summary>
-        class Idle final : public StateBase
-        {
-        public:
-            Idle(Receiver* owner) : StateBase(owner) {}
-            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
-            {
-                if (buffer.Size() < sizeof(Packet::size)) {
-                    //ヘッダー部を完全に受信できていない
-                    // Insufficientステートをセットアップして次回以降に続きを受信
-                    Insufficient().Continue(buffer.Consume(buffer.Size()));
-                    return {&Insufficient(), Buffer(buffer.End(),0)};
-                }
-                const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
-                if (packet->size > buffer.Size()) {
-                    //パケットサイズが受信バッファー残サイズより大きい場合
-                    // Continuationをセットアップして続きは次回以降に取得
-                    Continuation().Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
-                    return {&Continuation(), Buffer(buffer.End(),0)};
-                }
-                //1パケット受信
-                return { this, buffer.Consume(packet->size) };
-            }
-        };
-
-        /// <summary>
-        /// 連続した受信をまたぐ状態
-        /// </summary>
-        class Continuation final : public StateBase
-        {
-        private:
-            size_t remain;
-        public:
-            Continuation(Receiver* owner)
-                : StateBase(owner), remain(0)
-            {
-            }
-
-            /// <summary>
-            /// 受信済みデータをプール領域にセットアップ
-            /// </summary>
-            /// <param name="buffer">プール領域へ保存するバッファー</param>
-            /// <param name="totalRemain">未受信データサイズ</param>
-            void Continue(Buffer buffer, size_t totalRemain)
-            {
-                Pool().clear();
-                Pool().insert(Pool().end(), buffer.Start(), buffer.End());
-                this->remain = totalRemain;
-            }
-
-            /// <summary>
-            /// 未受信データサイズをセットアップ。プール領域にはすでに受信済みデータが存在することが前提。
-            /// </summary>
-            /// <param name="totalRemain">未受信データサイズ</param>
-            void Continue(size_t totalRemain)
-            {
-                this->remain = totalRemain;
-            }
-
-            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
-            {
-                auto appendSize = (std::min)(buffer.Size(), remain);
-                auto appendBuf = buffer.Consume(appendSize);
-                Pool().insert(Pool().end(), appendBuf.Start(), appendBuf.End());
-                remain -= appendSize;
-                if (0 == remain) {
-                    //分割されたパケットを結合したものを戻り値とする
-                    return { &Idle(), Buffer(&Pool()[0], Pool().size())};
-                }
-                //まだ必要サイズに満たないので受信処理を継続
-                return { this, Buffer(buffer.End(),0) };
-            }
-        };
-
-        /// <summary>
-        /// ヘッダー領域途中で分割されている場合
-        /// </summary>
-        class Insufficient final : public StateBase
-        {
-        public:
-            Insufficient(Receiver* owner)
-                : StateBase(owner)
-            {
-            }
-
-            /// <summary>
-            /// 受信済みデータをプール領域にセットアップ
-            /// </summary>
-            /// <param name="buffer">プール領域へ保存するバッファー</param>
-            void Continue(Buffer buffer)
-            {
-                Pool().clear();
-                Pool().insert(Pool().end(), buffer.Start(), buffer.End());
-            }
-
-            virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
-            {
-                auto prevSize = static_cast<DWORD>(Pool().size());
-                Pool().insert(Pool().end(), buffer.Start(), buffer.End());
-                if (Pool().size() < sizeof(Packet::size)) {
-                    //ヘッダー領域が受信できていない
-                    auto consumed = buffer.Consume(buffer.Size());
-                    return { this, Buffer(buffer.End(),0) };
-                }
-                const Packet* packet = reinterpret_cast<const Packet*>(&Pool()[0]);
-                const DWORD remain = packet->size - prevSize;
-                if (remain > buffer.Size() ) {
-                    //パケットサイズが受信バッファー残サイズより大きい場合
-                    Continuation().Continue(remain - buffer.Size());
-                    buffer.Consume(buffer.Size());
-                    return { &Continuation(), Buffer(buffer.End(),0) };
-                }
-                //完全なパケットが取得できた
-                buffer.Consume(remain);
-                return { &Idle(),  Buffer(&Pool()[0], packet->size)};
-            }
-
-        };
-
-        //受信バッファーをまたいだ場合の一時保存領域
-        std::vector<BYTE> pool;
-
-        ReceivedCallback callback;
-
-        Idle idle;
-        Continuation continuation;
-        Insufficient insufficient;
-        StateBase* state;
-
-    public:
-        Receiver() = delete;
-        Receiver(Receiver&&) = delete;
-        Receiver(const Receiver&) = delete;
-
-        Receiver& operator=(Receiver&&) = delete;
-        Receiver& operator=(const Receiver&) = delete;
-
-        /// <summary>
-        /// コンストラクタ
-        /// </summary>
-        /// <param name="reserveSize">受信バッファー初期リザーブサイズ</param>
-        /// <param name="callback">受信コールバック</param>
-        Receiver(size_t reserveSize, ReceivedCallback callback)
-            : callback(callback)
-            , idle(this)
-            , continuation(this)
-            , insufficient(this)
-            , state(&idle)
-        {
-            pool.reserve(reserveSize);
-        }
-
-        /// <summary>
-        /// 受信データ処理
-        /// </summary>
-        /// <param name="p">受信バッファー</param>
-        /// <param name="size">サイズ</param>
-        void Feed(LPCVOID p, size_t size)
-        {
-            auto buffer = Buffer(p, size);
-            //バッファー内をすべて処理するまで繰り返し
-            while (!buffer.Empty()) {
-                std::tuple<StateBase*, Buffer> res = state->Feed(buffer);
-                state = std::get<0>(res);
-                if (!std::get<1>(res).Empty()) {
-                    const Packet* packet = reinterpret_cast<const Packet*>(std::get<1>(res).Pointer());
-                    callback(packet->data, packet->size - sizeof(packet->size));
-                }
-            }
-        }
-
-        /// <summary>
-        /// 初期状態にリセット
-        /// </summary>
-        void Reset()
-        {
-            state = &idle;
-        }
-    };
-#pragma endregion
-
     //推奨バッファーサイズ
     constexpr DWORD TYPICAL_BUFFER_SIZE = 64 * 1024;
     //最少バッファーサイズ
     constexpr DWORD MIN_BUFFER_SIZE = 40;
+    static_assert(TYPICAL_BUFFER_SIZE >= MIN_BUFFER_SIZE);
 
     /// <summary>
     /// イベント種別
@@ -299,74 +44,380 @@ namespace abt::comm::simple_pipe
         const std::optional<concurrency::task<void>> errTask;
     };
 
-    class Flag
-    {
-    private:
-        LONG flag;
-    public:
-        Flag() : flag(0) {}
-        inline bool Test() { return 1 == InterlockedCompareExchange(&flag, 1, 1); }
-        inline bool Set() { return 1 == InterlockedCompareExchange(&flag, 1, 0); }
-    };
+    //送信・受信の最大サイズ。ただし、実際はメモリー状況によるのでこの値を保証するものではない。
+    inline static constexpr size_t MAX_DATA_SIZE = (std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD);
 
     /// <summary>
     /// 名前付きパイプ共通ベースクラス
     /// </summary>
-    template<DWORD BUF_SIZE>
     class SimpleNamedPipeBase
     {
+    public:
+        SimpleNamedPipeBase() = delete;
+        SimpleNamedPipeBase(SimpleNamedPipeBase&&) = delete;
+        SimpleNamedPipeBase(const SimpleNamedPipeBase&) = delete;
+
+        SimpleNamedPipeBase& operator=(SimpleNamedPipeBase&&) = delete;
+        SimpleNamedPipeBase& operator=(const SimpleNamedPipeBase&) = delete;
+        virtual ~SimpleNamedPipeBase()
+        {
+            //監視タスク終了待ち（例外は無視）
+            Close();
+            try { watcherTask.wait(); }
+            catch (...) {};
+        }
+
+#pragma region Receiver
+        using ReceivedCallback = std::function<void(LPCVOID, size_t)>;
+        /// <summary>
+        /// データパケット
+        /// </summary>
+        struct Packet
+        {
+            //size分も含めた全体のサイズ
+            alignas(4) DWORD size;
+            BYTE data[1];
+        };
+
+        /// <summary>
+        /// 受信バッファー管理クラス
+        /// </summary>
+        class Buffer
+        {
+        private:
+            const BYTE* sp;
+            const BYTE* ep;
+        public:
+            explicit Buffer(LPCVOID buffer, size_t size)
+                : sp{ reinterpret_cast<const BYTE*>(buffer) }
+                , ep{ reinterpret_cast<const BYTE*>(buffer) + size }
+            {}
+            const BYTE* Begin() const { return sp; }
+            const BYTE* End() const { return ep; }
+            bool Empty() const { return sp == ep; }
+            const BYTE* Pointer() const { return sp; }
+            size_t Size() const { return std::distance(sp, ep); }
+            Buffer Consume(size_t size)
+            {
+                if (size > Size()) {
+                    throw std::length_error("size is too large");
+                }
+                auto preSp = sp;
+                sp += size;
+                return Buffer(preSp, size);
+            }
+        };
+
+        /// <summary>
+        /// 受信データ復号クラス
+        /// </summary>
+        class Receiver
+        {
+        private:
+            class Idle;
+            class Continuation;
+            class Insufficient;
+
+            /// <summary>
+            /// 受信ステート基底クラス
+            /// </summary>
+            class StateBase
+            {
+            protected:
+                Receiver* owner;
+                StateBase() : owner(nullptr) {}
+                StateBase(Receiver* owner) : owner{ owner } {}
+
+            protected:
+                inline std::vector<BYTE>& Pool() { return owner->pool; }
+
+                inline Idle& Idle() { return owner->idle; }
+                inline Continuation& Continuation() { return owner->continuation; }
+                inline Insufficient& Insufficient() { return owner->insufficient; }
+
+            public:
+                /// <summary>
+                /// 受信データ処理
+                /// </summary>
+                /// <param name="buffer">入力受信データ</param>
+                /// <returns>{次のステート, 出力パケット(Empty()==true時は取得パケットなし) }</returns>
+                virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) = 0;
+                virtual ~StateBase() {}
+            };
+
+            /// <summary>
+            /// パケットが受信データをまたがない状態
+            /// </summary>
+            class Idle final : public StateBase
+            {
+            public:
+                Idle(Receiver* owner) : StateBase(owner) {}
+                virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+                {
+                    if (buffer.Size() < sizeof(Packet::size)) {
+                        //ヘッダー部を完全に受信できていない
+                        // Insufficientステートをセットアップして次回以降に続きを受信
+                        Insufficient().Continue(buffer.Consume(buffer.Size()));
+                        return { &Insufficient(), Buffer(buffer.End(),0) };
+                    }
+                    const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
+                    if (packet->size > buffer.Size()) {
+                        //パケットサイズが受信バッファー残サイズより大きい場合
+                        // Continuationをセットアップして続きは次回以降に取得
+                        Continuation().Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
+                        return { &Continuation(), Buffer(buffer.End(),0) };
+                    }
+                    //1パケット受信。パケットサイズ分を受信データから切り出し。
+                    return { this, buffer.Consume(packet->size) };
+                }
+            };
+
+            /// <summary>
+            /// 連続した受信をまたぐ状態
+            /// </summary>
+            class Continuation final : public StateBase
+            {
+            private:
+                size_t remain{ 0 };
+            public:
+                Continuation(Receiver* owner) : StateBase(owner) {}
+
+                /// <summary>
+                /// 受信済みデータをプール領域にセットアップ
+                /// </summary>
+                /// <param name="buffer">プール領域へ保存するバッファー</param>
+                /// <param name="totalRemain">未受信データサイズ</param>
+                void Continue(Buffer buffer, size_t totalRemain)
+                {
+                    Pool().clear();
+                    Pool().insert(Pool().end(), buffer.Begin(), buffer.End());
+                    this->remain = totalRemain;
+                }
+
+                /// <summary>
+                /// 未受信データサイズをセットアップ。プール領域にはすでに受信済みデータが存在することが前提。
+                /// </summary>
+                /// <param name="totalRemain">未受信データサイズ</param>
+                void Continue(size_t totalRemain)
+                {
+                    this->remain = totalRemain;
+                }
+
+                virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+                {
+                    auto appendSize = (std::min)(buffer.Size(), remain);
+                    auto appendBuf = buffer.Consume(appendSize);
+                    Pool().insert(Pool().end(), appendBuf.Begin(), appendBuf.End());
+                    remain -= appendSize;
+                    if (0 == remain) {
+                        //分割されたパケットを結合したものを戻り値とする
+                        return { &Idle(), Buffer(&Pool()[0], Pool().size()) };
+                    }
+                    //まだ必要サイズに満たないので受信処理を継続。
+                    return { this, Buffer(buffer.End(),0) };
+                }
+            };
+
+            /// <summary>
+            /// ヘッダー領域途中で分割されている場合
+            /// </summary>
+            class Insufficient final : public StateBase
+            {
+            public:
+                Insufficient(Receiver* owner) : StateBase(owner) {}
+
+                /// <summary>
+                /// 受信済みデータをプール領域にセットアップ
+                /// </summary>
+                /// <param name="buffer">プール領域へ保存するバッファー</param>
+                void Continue(Buffer buffer)
+                {
+                    Pool().clear();
+                    Pool().insert(Pool().end(), buffer.Begin(), buffer.End());
+                }
+
+                virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
+                {
+                    auto prevSize = static_cast<DWORD>(Pool().size());
+                    //パケットサイズが分からないので、受信データ全てをプール領域へコピーする
+                    Pool().insert(Pool().end(), buffer.Begin(), buffer.End());
+                    if (Pool().size() < sizeof(Packet::size)) {
+                        //ヘッダー領域が受信できていない
+                        auto consumed = buffer.Consume(buffer.Size());
+                        return { this, Buffer(buffer.End(),0) };
+                    }
+                    const Packet* packet = reinterpret_cast<const Packet*>(&Pool()[0]);
+                    const DWORD remain = packet->size - prevSize;
+                    if (remain > buffer.Size()) {
+                        //パケットサイズが受信バッファー残サイズより大きい場合
+                        Continuation().Continue(remain - buffer.Size());
+                        buffer.Consume(buffer.Size());
+                        //足らないパケットデータは次回以降で受信する
+                        return { &Continuation(), Buffer(buffer.End(),0) };
+                    }
+                    //完全なパケットが取得できた
+                    buffer.Consume(remain);
+                    return { &Idle(),  Buffer(&Pool()[0], packet->size) };
+                }
+
+            };
+
+            //受信バッファーをまたいだ場合の一時保存領域
+            std::vector<BYTE> pool;
+
+            //受信コールバック
+            ReceivedCallback callback;
+
+            Idle idle;
+            Continuation continuation;
+            Insufficient insufficient;
+            StateBase* state;
+
+        public:
+            Receiver() = delete;
+            Receiver(Receiver&&) = delete;
+            Receiver(const Receiver&) = delete;
+
+            Receiver& operator=(Receiver&&) = delete;
+            Receiver& operator=(const Receiver&) = delete;
+
+            /// <summary>
+            /// コンストラクタ
+            /// </summary>
+            /// <param name="reserveSize">受信バッファー初期リザーブサイズ</param>
+            /// <param name="callback">受信コールバック</param>
+            Receiver(size_t reserveSize, ReceivedCallback callback)
+                : callback(callback)
+                , idle(this)
+                , continuation(this)
+                , insufficient(this)
+                , state(&idle)
+            {
+                if (!callback) {
+                    throw std::invalid_argument("bad callback error");
+                }
+                pool.reserve(reserveSize);
+            }
+
+            /// <summary>
+            /// 受信データ処理
+            /// </summary>
+            /// <param name="p">受信バッファー</param>
+            /// <param name="size">サイズ</param>
+            void Feed(LPCVOID p, size_t size)
+            {
+                auto buffer = Buffer(p, size);
+                //バッファー内をすべて処理するまで繰り返し
+                while (!buffer.Empty()) {
+                    std::tuple<StateBase*, Buffer> res = state->Feed(buffer);
+                    state = std::get<0>(res);
+                    if (!std::get<1>(res).Empty()) {
+                        //受信パケットデータが存在したら受信コールバクを実行
+                        const Packet* packet = reinterpret_cast<const Packet*>(std::get<1>(res).Pointer());
+                        callback(packet->data, packet->size - sizeof(packet->size));
+                    }
+                }
+            }
+
+            /// <summary>
+            /// 初期状態にリセット
+            /// </summary>
+            void Reset()
+            {
+                state = &idle;
+            }
+        };
+#pragma endregion
+        class Flag
+        {
+        private:
+            LONG flag;
+        public:
+            Flag() : flag(0) {}
+            inline bool Test() { return 1 == InterlockedCompareExchange(&flag, 1, 1); }
+            inline bool Set() { return 1 == InterlockedCompareExchange(&flag, 1, 0); }
+        };
     private:
         //パイプハンドル
         winrt::file_handle handlePipe;
         //受信用オーバーラップ構造体
-        OVERLAPPED readOverlap ;
+        OVERLAPPED readOverlap = { 0 };
         //受信バッファー
         std::unique_ptr<BYTE[]> readBuffer;
+        //Closeイベント
+        winrt::handle closeEvent;
         //受信イベント
         winrt::handle readEvent;
+        //カスタムイベント
+        std::vector<winrt::handle> customEvents;
+        //監視タスク
+        concurrency::task<void> watcherTask;
         //受信パケット処理
-        std::unique_ptr<Receiver> receiver;
+        Receiver receiver;
         //送信バッファーロック
         concurrency::critical_section writeCs;
         //クローズ中フラグ
         Flag closing;
+        //バッファーサイズ
+        const DWORD bufferSize;
 
+        /// <summary>
+        /// RAIIヘルパー
+        /// </summary>
         struct Defer {
             std::function<void(void)> func;
             Defer(std::function<void(void)> func) : func(func) {}
-            ~Defer() { if (func) func(); }
-            void Detach() { func = std::function<void(void)>(); }
+            virtual ~Defer() { if (func) func(); }
         };
 
+        /// <summary>
+        /// 非同期Write用のワーク領域
+        /// </summary>
         struct WriteOverlapTag {
+            //呼び出し元のポインター
             SimpleNamedPipeBase* owner;
-            LPCVOID buffer;
-            DWORD remain;
+            //書き込みバッファー
+            Buffer buffer;
+            //Win32システムエラー
             DWORD lastErr;
+            //成功フラグ
             bool success;
-            bool completed;
+            //書き込み完了チェック
+            bool Completed() const { return buffer.Empty(); }
         };
 
+        // 非同期書き込み用コールバック関数
+        // https://learn.microsoft.com/ja-jp/windows/win32/api/minwinbase/nc-minwinbase-lpoverlapped_completion_routine
         static void WriteOverlapComplete(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
         {
             WriteOverlapTag* tag = reinterpret_cast<WriteOverlapTag*>(lpOverlapped->hEvent);
             tag->lastErr = dwErrorCode;
-            if (ERROR_SUCCESS != dwErrorCode) {
+            if (ERROR_SUCCESS != tag->lastErr) {
+                //Win32エラー発生
                 tag->success = false;
                 return;
             }
-            DWORD remain = tag->remain - dwNumberOfBytesTransfered;
-            if (0 > remain) {
+            try {
+                //書き込み済み領域を消費
+                tag->buffer.Consume(dwNumberOfBytesTransfered);
+            }
+            catch (std::length_error&)
+            {
+                //書き込み済み領域と書き込んだバイト数に不整合あり
                 tag->success = false;
                 return;
             }
-            tag->remain = remain;
-            tag->completed = tag->remain == 0;
-            tag->buffer = reinterpret_cast<const BYTE*>(tag->buffer) + dwNumberOfBytesTransfered;
+            //書き込み成功
             tag->success = true;
             return;
         }
 
+        /// <summary>
+        /// 非同期書き込みを同期的に実行
+        /// </summary>
+        /// <param name="buffer">書き込みバッファー</param>
+        /// <param name="size">バッファーサイズ</param>
+        /// <param name="ct">キャンセルトークン</param>
         void WriteRaw(LPCVOID buffer, DWORD size, concurrency::cancellation_token ct)
         {
             winrt::handle cancelEvent{CreateEventW(nullptr, true, false, nullptr)};
@@ -382,23 +433,30 @@ namespace abt::comm::simple_pipe
                 });
             }
             //オーバーラップ構造体の設定
-            WriteOverlapTag tag{ this, buffer, size, ERROR_SUCCESS, true, false };
-            while (!tag.completed && tag.remain > 0) {
+            WriteOverlapTag tag{ this, Buffer(buffer, size), ERROR_SUCCESS, true};
+            while (!tag.Completed() && tag.success) {
                 OVERLAPPED overlapped = { 0 };
+                //一度に送信するサイズをコンストラクタ引数のbufferSizeまでに制限
+                DWORD writeSize = (std::min)(static_cast<DWORD>(tag.buffer.Size()), bufferSize);
+                //WriteFileExはhEventは利用しないので、ワーク領域のポインターを格納する
+                // https://learn.microsoft.com/ja-jp/windows/win32/api/fileapi/nf-fileapi-writefileex
                 overlapped.hEvent = reinterpret_cast<HANDLE>(&tag);
-                winrt::check_bool(WriteFileEx(handlePipe.get(), tag.buffer, tag.remain, &overlapped, &SimpleNamedPipeBase::WriteOverlapComplete));
+                winrt::check_bool(WriteFileEx(handlePipe.get(), tag.buffer.Pointer(), writeSize, &overlapped, &SimpleNamedPipeBase::WriteOverlapComplete));
                 auto res = WaitForSingleObjectEx(cancelEvent.get(), INFINITE, true);
                 if (WAIT_OBJECT_0 == res) {
-                    //非同期送信をキャンセル
+                    //非同期書き込みをキャンセル
                     CancelIoEx(handlePipe.get(), &overlapped);
                     concurrency::cancel_current_task();
                     break;
                 }
                 else if (WAIT_IO_COMPLETION == res) {
+                    // I/O完了
                     if (!tag.success) {
                         if (ERROR_SUCCESS != tag.lastErr) {
+                            //Win32エラーが発生していたら例外送出
                             winrt::throw_hresult(HRESULT_FROM_WIN32(tag.lastErr));
                         }
+                        //不明なエラーの場合
                         throw std::logic_error("WriteRaw logic error");
                     }
                 }
@@ -412,10 +470,160 @@ namespace abt::comm::simple_pipe
         }
 
         /// <summary>
+        /// イベント監視タスク
+        /// </summary>
+        /// <returns>非同期タスク</returns>
+        concurrency::task<void> WatchAsync()
+        {
+            //タスクを実行
+            return concurrency::create_task([this](){
+                //既知のイベント登録 Close要求イベント, 非同期I/Oの読み込み完了イベント
+                std::vector<HANDLE> handles {closeEvent.get(), readEvent.get()};
+                //派生クラスで利用するイベントを追加
+                std::vector<HANDLE> customEventHandels;
+                std::transform(customEvents.begin(), customEvents.end(), std::back_inserter(customEventHandels), [](const auto& e) {return e.get(); });
+                handles.insert(handles.end(), customEventHandels.begin(), customEventHandels.end());
+
+                Defer defer([this]() {ClosePipeHandle(); });
+                while (true) {
+                    //接続、受信イベントを監視
+                    auto res = WaitForMultipleObjects(static_cast<DWORD>(handles.size()), &handles[0], false, INFINITE);
+                    if (res == WAIT_FAILED) {
+                        //エラー
+                        winrt::throw_last_error();
+                    }
+                    if (!Valid()) {
+                        //ハンドルが破棄されていたら終了
+                        break;
+                    }
+                    auto index = res - WAIT_OBJECT_0;
+                    if (0 <= index && index < handles.size()) {
+                        if (closeEvent.get() == handles[index]) {
+                            //Close要求イベント
+                            break;
+                        }
+                        else if (readEvent.get() == handles[index]) {
+                            //受信イベント
+                            if (!OnSignalRead()) {
+                                //切断検知
+                                //切断コールバック
+                                if (!OnDisconnected()) {
+                                    //クローズ要求時
+                                    break;
+                                }
+                            }
+                        } else {
+                            //継承先のイベントハンドラを呼び出し
+                            if (!OnFireEvent(handles[index])) {
+                                //クローズ要求時
+                                break;
+                            }
+                        }
+                    }
+                    else {
+                        //いずれかのハンドルが破棄されたのならインスタンスが破棄されている
+                        break;
+                    }
+                }
+            });
+        }
+
+    protected:
+        /// <summary>
+        /// コンストラクタ
+        /// </summary>
+        /// <param name="handle">パイプハンドル</param>
+        /// <param name="receivedCallback">データ受信コールバック。受信データは関数呼び出し中でのみ有効。</param>
+        SimpleNamedPipeBase(HANDLE handle, DWORD bufferSize, size_t costomEventCount = 0)
+            : handlePipe(handle)
+            , bufferSize(bufferSize)
+            , readBuffer(std::make_unique<BYTE[]>(bufferSize))
+            , receiver(bufferSize, std::bind(&SimpleNamedPipeBase::OnReceived, this, std::placeholders::_1, std::placeholders::_2))
+        {
+            if( bufferSize < MIN_BUFFER_SIZE) {
+                throw std::invalid_argument("BUF_SIZE is too short");
+            }
+            if (!handle) {
+                throw std::invalid_argument("handle is invalid");
+            }
+
+            //受信イベント
+            readEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
+            winrt::check_bool(bool{ readEvent });
+            readOverlap.hEvent = readEvent.get();
+
+            //ハンドルクローズ要求イベント
+            closeEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
+            winrt::check_bool(bool{ closeEvent });
+
+            //引数で指定された継承クラス用のカスタムイベント
+            for (size_t i = 0; i < costomEventCount; ++i) {
+                winrt::handle h({ CreateEventW(nullptr, false , false, nullptr) });
+                winrt::check_bool(bool{ h });
+                customEvents.emplace_back(std::move(h));
+            }
+
+            //監視タスク開始
+            watcherTask = WatchAsync().then([this](concurrency::task<void> prevTask) {
+                try {
+                    prevTask.wait();
+                }
+                catch (...)
+                {
+                    //監視タスクが例外発生で終了していた場合
+                    OnTrapException(prevTask);
+                }
+            });
+        }
+
+        /// <summary>
+        /// パイプハンドル
+        /// </summary>
+        /// <returns>パイプハンドル</returns>
+        const HANDLE Handle() const { return handlePipe.get(); }
+
+        /// <summary>
+        /// 継承クラスで指定したカスタムイベントのリスト
+        /// </summary>
+        /// <returns>継承クラスで指定したカスタムイベントのリスト</returns>
+        const std::vector<winrt::handle>& CustomEvents() const { return customEvents; }
+
+        /// <summary>
+        /// レシーバーを初期化
+        /// </summary>
+        void ResetReceiver() { receiver.Reset(); }
+
+        /// <summary>
+        /// 受信イベント
+        /// </summary>
+        /// <param name="buffer">受信データ（パケットのヘッダーは含まない）</param>
+        /// <param name="size">受信データサイズ</param>
+        virtual void OnReceived(LPCVOID buffer, size_t size) = 0;
+
+        /// <summary>
+        /// 切断イベント
+        /// </summary>
+        /// <returns>false:時はハンドルを閉じて以降は利用不可能とする。</returns>
+        virtual bool OnDisconnected() = 0;
+
+        /// <summary>
+        /// 監視タスクでの捕捉例外通知
+        /// </summary>
+        /// <param name="errTask">エラーが発生したタスクオブジェクト</param>
+        virtual void OnTrapException(concurrency::task<void> errTask) = 0;
+
+        /// <summary>
+        /// 継承クラスで設定したイベント発生通知
+        /// </summary>
+        /// <param name="handle">イベントハンドル</param>
+        /// <returns>false:時はハンドルを閉じて以降は利用不可能とする。</returns>
+        virtual bool OnFireEvent(HANDLE handle) = 0;
+
+        /// <summary>
         /// 非同期受信完了時の処理
         /// </summary>
         /// <returns>false時は切断状態</returns>
-        bool OnRead()
+        virtual bool OnRead()
         {
             DWORD readSize = 0;
             if (!GetOverlappedResult(handlePipe.get(), &readOverlap, &readSize, FALSE)) {
@@ -437,52 +645,9 @@ namespace abt::comm::simple_pipe
                 return false;
             }
             //データ受信
-            receiver->Feed(readBuffer.get(), readSize);
+            receiver.Feed(readBuffer.get(), readSize);
             return true;
         }
-
-    public:
-        //送信・受信バッファーサイズ
-        inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
-        //1回の送信・受信の最大サイズ
-        inline static constexpr size_t MAX_DATA_SIZE = (std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD);
-
-        SimpleNamedPipeBase() = delete;
-        SimpleNamedPipeBase(SimpleNamedPipeBase&&) = delete;
-        SimpleNamedPipeBase(const SimpleNamedPipeBase&) = delete;
-
-        SimpleNamedPipeBase& operator=(SimpleNamedPipeBase&&) = delete;
-        SimpleNamedPipeBase& operator=(const SimpleNamedPipeBase&) = delete;
-
-        /// <summary>
-        /// コンストラクタ
-        /// </summary>
-        /// <param name="handle">パイプハンドル</param>
-        /// <param name="receivedCallback">データ受信コールバック。受信データは関数呼び出し中でのみ有効。</param>
-        SimpleNamedPipeBase(HANDLE handle, ReceivedCallback receivedCallback)
-            : handlePipe(handle)
-            , readOverlap({ 0 })
-            , readBuffer(std::make_unique<BYTE[]>(BUF_SIZE))
-            , receiver(std::make_unique<Receiver>(BUF_SIZE, receivedCallback))
-        {
-            if constexpr(BUF_SIZE < MIN_BUFFER_SIZE) {
-                throw std::invalid_argument("BUF_SIZE is too short");
-            }
-            if (!static_cast<bool>(handle)) {
-                throw std::invalid_argument("handle is invalid");
-            }
-            readEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
-            winrt::check_bool(static_cast<bool>(readEvent));
-            readOverlap.hEvent = readEvent.get();
-        }
-
-        virtual ~SimpleNamedPipeBase() {}
-
-        virtual const HANDLE Handle() { return handlePipe.get(); }
-        virtual const bool Valid() { return static_cast<bool>(handlePipe); }
-        virtual const std::unique_ptr<BYTE[]>& ReadBuffer() { return readBuffer; }
-        virtual const winrt::handle& ReadEvent() { return readEvent; }
-        virtual void Reset() { receiver->Reset(); }
 
         /// <summary>
         /// 非同期受信開始
@@ -495,7 +660,7 @@ namespace abt::comm::simple_pipe
             readOverlap.OffsetHigh = 0;
             //受信処理
             // 同期的の受信できる限りは受信処理を継続
-            while (ReadFile(handlePipe.get(), readBuffer.get(), BUF_SIZE, nullptr, &readOverlap)) {
+            while (ReadFile(handlePipe.get(), readBuffer.get(), bufferSize, nullptr, &readOverlap)) {
                 if (!OnRead()) {
                     //切断状態となった
                     return false;
@@ -511,8 +676,8 @@ namespace abt::comm::simple_pipe
                 //切断状態
                 return false;
             }
+            //I/O完了待ち以外ではエラー
             if (ERROR_IO_PENDING != lastErr) {
-                //I/O完了待ち以外ではエラー
                 if (!closing.Test()) {
                     winrt::throw_last_error();
                 }
@@ -538,6 +703,21 @@ namespace abt::comm::simple_pipe
         }
 
         /// <summary>
+        /// パイプハンドルを閉じる
+        /// </summary>
+        virtual void ClosePipeHandle()
+        {
+            if (closing.Set()) {
+                //すでにClose済み
+                return;
+            }
+            if (handlePipe) {
+                FlushFileBuffers(handlePipe.get());
+                handlePipe.close();
+            }
+        }
+    public:
+        /// <summary>
         /// 非同期送信処理
         /// </summary>
         /// <param name="buffer">送信バッファー</param>
@@ -546,12 +726,11 @@ namespace abt::comm::simple_pipe
         /// <returns>非同期タスク</returns>
         virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
         {
-            if (!static_cast<bool>(handlePipe)) {
+            if (!handlePipe) {
                 //handleが無効
-                throw std::runtime_error("this instance is invalid");
+                winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE));
             }
-
-            if (size > MAX_DATA_SIZE ) {
+            if (size > MAX_DATA_SIZE) {
                 throw std::length_error("size is too long");
             }
             auto writeSize = static_cast<DWORD>(size);
@@ -563,128 +742,46 @@ namespace abt::comm::simple_pipe
                 auto packetSize = writeSize + static_cast<DWORD>(sizeof(DWORD));
                 //データサイズを送信
                 WriteRaw(&packetSize, sizeof(packetSize), ct);
-                //データ保体を送信
+                //データ本体を送信
                 WriteRaw(buffer, writeSize, ct);
             }, concurrency::task_options(ct));
         }
 
         virtual void Close()
         {
-            if (closing.Set()) {
-                //すでにclose実行済み
-                return;
-            }
-            if (static_cast<bool>(handlePipe)) {
-                FlushFileBuffers(handlePipe.get());
-                handlePipe.close();
-            }
+            winrt::check_bool(SetEvent(closeEvent.get()));
         }
+
+        virtual bool Valid() const { return bool{ handlePipe }; }
     };
 
     /// <summary>
     /// 名前付きパイプサーバークラス
     /// </summary>
     template<DWORD BUF_SIZE>
-    class SimpleNamedPipeServer
+    class SimpleNamedPipeServer : public SimpleNamedPipeBase
     {
+        static_assert(BUF_SIZE >= MIN_BUFFER_SIZE);
     public:
-        using Base = SimpleNamedPipeBase<BUF_SIZE>;
-        inline static constexpr DWORD BUFFER_SIZE = Base::BUFFER_SIZE;
-        inline static constexpr size_t MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
+        inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
         using Callback = std::function<void(SimpleNamedPipeServer<BUF_SIZE>&, const PipeEventParam&)>;
+
     private:
-        Base base;
-
-        const std::wstring pipeName;
+        const winrt::hstring pipeName;
         Callback callback;
-        OVERLAPPED connectionOverlap;
-        winrt::handle connectionEvent;
-        winrt::handle disconnectionEvent;
-        winrt::handle stopEvent;
-        concurrency::task<void> watcherTask;
-
-        void Received(LPCVOID buffer, size_t size)
-        {
-            callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer, size });
-        }
-
-        /// <summary>
-        /// イベント監視タスク
-        /// </summary>
-        /// <returns>非同期タスク</returns>
-        concurrency::task<void> WatchAsync()
-        {
-            return concurrency::create_task([this]() {
-                while (true) {
-                    //接続、受信イベントを監視
-                    const HANDLE handles[]{ stopEvent.get(), disconnectionEvent.get(), connectionEvent.get(), base.ReadEvent().get() };
-                    auto res = WaitForMultipleObjects(_countof(handles), handles, false, INFINITE);
-                    if (res == WAIT_FAILED) {
-                        //エラー
-                        winrt::throw_last_error();
-                    }
-                    if (!base.Valid()) {
-                        //ハンドルが破棄されていたら終了
-                        break;
-                    }
-                    auto index = res - WAIT_OBJECT_0;
-                    if (0 <= index && index < _countof(handles)) {
-                        bool connected = false;
-                        if (stopEvent.get() == handles[index]) {
-                            //停止イベント
-                            break;
-                        } else if(disconnectionEvent.get() == handles[index]){
-                            //切断実行通知イベント
-                            connected = false;
-                        } else if (connectionEvent.get() == handles[index]) {
-                            //クライアント接続
-                            // 非同期データ受信処理開始
-                            connected = base.OverappedRead();
-                            //接続イベント
-                            OnConnected();
-                        }
-                        else if (base.ReadEvent().get() == handles[index]) {
-                            //受信イベント
-                            connected = base.OnSignalRead();
-                        }
-                        if (!connected) {
-                            //切断検知
-                            //切断コールバック
-                            callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
-                            try {
-                                //終了した接続の後始末をして次回接続の待機
-                                DisconnectInner();
-                                //次回接続待ち開始
-                                BeginConnect();
-                            }
-                            catch (winrt::hresult_error& ex) {
-                                if (ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
-                                    //閉じる段階でハンドルが破棄された場合
-                                    break;
-                                }
-                                throw;
-                            }
-                        }
-                    }
-                    else {
-                        auto index2 = res - WAIT_ABANDONED_0;
-                        if (0 <= index2 && index2 < _countof(handles)) {
-                            //いずれかのハンドルが破棄されたのならインスタンスが破棄されている
-                            break;
-                        }
-                    }
-                }
-                //監視スレッド終了後はこのインスタンスは利用できない
-                base.Close();
-                });
-        }
+        OVERLAPPED connectionOverlap = { 0 };
+        HANDLE connectionEvent;
+        HANDLE disconnectionEvent;
 
         /// <summary>
         /// 次回の接続待ち開始
         /// </summary>
         void BeginConnect()
         {
-            if (!ConnectNamedPipe(base.Handle(), &connectionOverlap)) {
+            ResetReceiver();
+            connectionOverlap = { 0 };
+            connectionOverlap.hEvent = connectionEvent;
+            if (!ConnectNamedPipe(Handle(), &connectionOverlap)) {
                 auto lastErr = GetLastError();
                 if (ERROR_PIPE_LISTENING != lastErr
                         && ERROR_IO_PENDING != lastErr
@@ -693,13 +790,65 @@ namespace abt::comm::simple_pipe
                     winrt::throw_last_error();
                 }
             }
-            base.Reset();
+        }
+
+    protected:
+        virtual bool OnFireEvent(HANDLE handle) override
+        {
+            bool connected = false;
+            if (handle == connectionEvent) {
+                //クライアント接続
+                // 非同期データ受信処理開始
+                connected = OverappedRead();
+                //接続イベント
+                OnConnected();
+            }
+            else if (handle == disconnectionEvent) {
+                connected = false;
+            }
+            if (!connected) {
+                //切断要求/検知したら切断
+                if (!OnDisconnected()) {
+                    //クローズ要求時
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        virtual void OnReceived(LPCVOID buffer, size_t size) override
+        {
+            callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer, size });
+        }
+
+        virtual bool OnDisconnected() override
+        {
+            callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
+            try {
+                //終了した接続の後始末をして次回接続の待機
+                DisconnectInner();
+                //次回接続待ち開始
+                BeginConnect();
+            }
+            catch (winrt::hresult_error& ex) {
+                //INVALID_HANDLEの場合はすでにClose済みということなので例外とはしない
+                if (ex.code() != HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                    throw;
+                }
+            }
+            //引き続きパイプの処理は続ける
+            return true;
+        }
+
+        virtual void OnTrapException(concurrency::task<void> errTask)
+        {
+            callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, errTask });
         }
 
         /// <summary>
         /// 接続時処理
         /// </summary>
-        void OnConnected()
+        virtual void OnConnected()
         {
             callback(*this, PipeEventParam{ PipeEventType::CONNECTED, nullptr, 0 });
         }
@@ -709,8 +858,8 @@ namespace abt::comm::simple_pipe
         /// </summary>
         void DisconnectInner()
         {
-            FlushFileBuffers(base.Handle());
-            if (!DisconnectNamedPipe(base.Handle())) {
+            FlushFileBuffers(Handle());
+            if (!DisconnectNamedPipe(Handle())) {
                 auto lastErr = GetLastError();
                 if (ERROR_PIPE_NOT_CONNECTED != lastErr) {
                     //閉じられた状態のエラーは無視
@@ -760,69 +909,31 @@ namespace abt::comm::simple_pipe
         /// <param name="psa">セキュリティディスクリプタ</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeServer(LPCWSTR name, LPSECURITY_ATTRIBUTES psa, Callback callback)
-            : base(CreateServerHandle(name, psa)
-                , std::bind(&SimpleNamedPipeServer::Received, this, std::placeholders::_1, std::placeholders::_2))
+            : SimpleNamedPipeBase(CreateServerHandle(name, psa), BUF_SIZE, 2)
             , pipeName(name)
             , callback(callback)
-            , connectionOverlap({ 0 })
+            , connectionEvent{ CustomEvents()[0].get() }
+            , disconnectionEvent{ CustomEvents()[1].get() }
         {
-            //接続イベント作成
-            connectionEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
-            winrt::check_bool(static_cast<bool>(connectionEvent));
-            //接続用オーバーラップ構造体の初期化
-            connectionOverlap.hEvent = connectionEvent.get();
-            //切断イベント作成
-            disconnectionEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
-            winrt::check_bool(static_cast<bool>(disconnectionEvent));
-            //停止イベント作成
-            stopEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
-            winrt::check_bool(static_cast<bool>(stopEvent));
-
+            if (!callback) {
+                throw std::invalid_argument("bad callback error");
+            }
             //接続待ち開始
             BeginConnect();
-
-            //監視タスク開始
-            watcherTask = WatchAsync().then([this](concurrency::task<void> prevTask) {
-                try {
-                    prevTask.wait();
-                }
-                catch (...)
-                {
-                    //監視タスクが例外発生で終了していた場合
-                    base.Close();
-                    this->callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, prevTask });
-                }
-                });
         }
 
-        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
-        {
-            return base.WriteAsync(buffer, size, ct);
-        }
+        virtual winrt::hstring PipeName() const { return pipeName; }
 
-        virtual std::wstring PipeName() const { return pipeName; }
-
-        virtual bool Valid()
-        {
-            return base.Valid();
-        }
-
+        /// <summary>
+        /// クライアントを切断
+        /// </summary>
         virtual void Disconnect()
         {
-            winrt::check_bool(SetEvent(disconnectionEvent.get()));
+            //切断ベントをシグナル
+            winrt::check_bool(SetEvent(disconnectionEvent));
         }
 
-        virtual void Close()
-        {
-            winrt::check_bool(SetEvent(stopEvent.get()));
-        }
-
-        virtual ~SimpleNamedPipeServer()
-        {
-            Close();
-            try { watcherTask.wait(); }
-            catch (...) {};
-        }
+        virtual ~SimpleNamedPipeServer() {}
     };
 
     using TypicalSimpleNamedPipeServer = SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE>;
@@ -831,70 +942,34 @@ namespace abt::comm::simple_pipe
     /// 名前付きパイプクライアント
     /// </summary>
     template<DWORD BUF_SIZE>
-    class SimpleNamedPipeClient
+    class SimpleNamedPipeClient : public SimpleNamedPipeBase
     {
+        static_assert(BUF_SIZE >= MIN_BUFFER_SIZE);
     public:
-        using Base = SimpleNamedPipeBase<BUF_SIZE>;
-        inline static constexpr DWORD BUFFER_SIZE = Base::BUFFER_SIZE;
-        inline static constexpr size_t MAX_DATA_SIZE = Base::MAX_DATA_SIZE;
         using Callback = std::function<void(SimpleNamedPipeClient<BUF_SIZE>&, const PipeEventParam&)>;
+        inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
     private:
-        Base base;
+        const winrt::hstring pipeName;
+        const Callback callback;
 
-        const std::wstring pipeName;
-        Callback callback;
-        winrt::handle stopEvent;
-        concurrency::task<void> watcherTask;
-
-        void Received(LPCVOID buffer, size_t size)
+    protected:
+        virtual void OnReceived(LPCVOID buffer, size_t size) override
         {
             callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer, size });
         }
 
-        /// <summary>
-        /// イベント監視タスク
-        /// </summary>
-        /// <returns>非同期タスク</returns>
-        concurrency::task<void> WatchAsync()
+        virtual bool OnFireEvent(HANDLE) override { return true; }
+
+        virtual bool OnDisconnected() override
         {
-            return concurrency::create_task([this]() {
-                while (true) {
-                    const HANDLE handles[]{ stopEvent.get(), base.ReadEvent().get() };
-                    auto res = WaitForMultipleObjects(_countof(handles), handles, false, INFINITE);
-                    if (res == WAIT_FAILED) {
-                        //エラー
-                        winrt::throw_last_error();
-                    }
-                    if (!base.Valid()) {
-                        //名前付きパイプのハンドルが無効値ならばインスタンスは破棄されている
-                        break;
-                    }
-                    auto index = res - WAIT_OBJECT_0;
-                    if (0 <= index && index < _countof(handles)) {
-                        if (stopEvent.get() == handles[index]) {
-                            //停止イベント
-                            break;
-                        }
-                        else if (base.ReadEvent().get() == handles[index]) {
-                            //読み込みイベント
-                            if (!base.OnSignalRead()) {
-                                //切断状態の場合
-                                callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
-                                break;
-                            }
-                        }
-                    }
-                    else {
-                        auto index2 = res - WAIT_ABANDONED_0;
-                        if (0 <= index2 && index2 < _countof(handles)) {
-                            //いずれかのハンドルが破棄されたのならインスタンスが破棄されている
-                            break;
-                        }
-                    }
-                }
-                //監視スレッド終了後はこのインスタンスは利用できない
-                base.Close();
-            });
+            //切断時はパイプも閉じる
+            callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
+            return false;
+        }
+
+        virtual void OnTrapException(concurrency::task<void> errTask)
+        {
+            callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, errTask });
         }
 
     public:
@@ -910,7 +985,7 @@ namespace abt::comm::simple_pipe
         /// </summary>
         /// <param name="name">名称</param>
         /// <returns>ハンドル</returns>
-        HANDLE OpendPipeHandle(LPCWSTR name)
+        static HANDLE OpendPipeHandle(LPCWSTR name)
         {
             //接続可能状態まで待つ
             winrt::check_bool(WaitNamedPipe(name, NMPWAIT_USE_DEFAULT_WAIT));
@@ -936,56 +1011,20 @@ namespace abt::comm::simple_pipe
         /// <param name="name">名前付きパイプ名称</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeClient(LPCWSTR name, Callback callback)
-            : base(OpendPipeHandle(name)
-                , std::bind(&SimpleNamedPipeClient::Received, this, std::placeholders::_1, std::placeholders::_2))
+            : SimpleNamedPipeBase(OpendPipeHandle(name), BUF_SIZE)
             , pipeName(name)
             , callback(callback)
         {
-            //停止イベント作成
-            stopEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
-            winrt::check_bool(static_cast<bool>(stopEvent));
-
+            if (!callback) {
+                throw std::invalid_argument("bad callback error");
+            }
             //非同期受信処理開始
-            base.OverappedRead();
-
-            //監視タスク開始
-            watcherTask = WatchAsync().then([this](concurrency::task<void> prevTask) {
-                try {
-                    prevTask.wait();
-                }
-                catch (...)
-                {
-                    //監視タスクが例外発生で終了していた場合
-                    base.Close();
-                    this->callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, prevTask });
-                }
-                });
+            OverappedRead();
         }
 
-        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
-        {
-            return base.WriteAsync(buffer, size, ct);
-        }
+        virtual winrt::hstring PipeName() const { return pipeName; }
 
-        std::wstring PipeName() const { return pipeName; }
-
-        virtual bool Valid()
-        {
-            return base.Valid();
-        }
-
-        virtual void Close()
-        {
-            winrt::check_bool(SetEvent(stopEvent.get()));
-        }
-
-        virtual ~SimpleNamedPipeClient()
-        {
-            //監視タスク終了待ち（例外は無視）
-            Close();
-            try { watcherTask.wait();}
-            catch (...) {};
-        }
+        virtual ~SimpleNamedPipeClient() {}
     };
 
     using TypicalSimpleNamedPipeClient = SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE>;

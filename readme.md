@@ -13,33 +13,44 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 # 使い方
 ヘッダーファイル `SimpleNamedPipe.h` をinclude する。
 
+サーバーとクライアントは、`SimpleNamedPipeServer<BUF_SIZE>` と　`SimpleNamedPipeClient<BUF_SIZE>` の組み合わせで利用すること。
+
+データ長保証のためヘッダー情報を付加しており、この組み合わせでないと正常に動作しない。
+テンプレート引数の `BUF_SIZE` はサーバーとクライアントで異なる値でも動作する。
+
 ## サーバー
 `SimpleNamedPipeServer<BUF_SIZE>` でサーバーインスタンスを生成する。
 
 `BUF_SIZE` は通信バッファーサイズを指定する。
 
-`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合は、`std::invalid_argument` が発生する。
+`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合はコンパイルエラーとなる。
 
 第2引数に `LPSECURITY_ATTRIBUTES` を指定可能。nullptr時は既定のセキュリティ記述子となる。
 
-`TypicalSimpleNamedPipeServer` は `SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。これの使用を推奨する。
+`TypicalSimpleNamedPipeServer` は `SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。この使用を推奨する。
 
 ```cpp
+//パイプサーバーのサンプル
 SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const auto& param) {
     switch (param.type) {
     case PipeEventType::CONNECTED:
+        //クライアントが接続した
         std::wcout << L"connected" << std::endl;
         break;
     case PipeEventType::DISCONNECTED:
+        //クライアントが切断した
         std::wcout << L"diconnected" << std::endl;
         break;
     case PipeEventType::RECEIVED:
+        //受信データあり
         {
             auto message = std::wstring(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
             std::wcout << message << std::endl;
         }
         break;
     case PipeEventType::EXCEPTION:
+        //管理スレッドで例外発生
+        //このイベント発生時はパイプは終了する
         if (param.errTask) {
             try { param.errTask.value().wait(); }
             catch (winrt::hresult_error& ex) {
@@ -65,17 +76,20 @@ SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const a
 
 `BUF_SIZE` は通信バッファーサイズを指定する。
 
-`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合は、`std::invalid_argument` が発生する。
+`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合はコンパイルエラーとなる。
 
-`TypicalSimpleNamedPipeClient` は `SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。これの使用を推奨する。
+`TypicalSimpleNamedPipeClient` は `SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。この使用を推奨する。
 
 ```cpp
 SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) {
     switch (param.type) {
     case PipeEventType::DISCONNECTED:
+        //サーバーから切断した。以後は通信不可能。
+        //再接続したい場合は新たにインスタンスを生成する。
         std::wcout << L"diconnected" << std::endl;
         break;
     case PipeEventType::RECEIVED:
+        //受信データあり
         {
             auto message = std::wstring(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
             std::wcout << message << std::endl;
@@ -83,6 +97,8 @@ SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) 
         }
         break;
     case PipeEventType::EXCEPTION:
+        //管理スレッドで例外発生
+        //このイベント発生時はパイプは終了する
         if (param.errTask) {
             try { param.errTask.value().wait(); }
             catch (winrt::hresult_error& ex) {
@@ -104,16 +120,17 @@ SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) 
 ```
 # 利用上の注意点
 
-
 ## 受信バッファーについて
 イベントコールバックの受信バッファーはコールバック中の間だけしか値の保証をしない。
 
-そのため、継続して受信バッファーの内容を利用する場合はコピーする必要がある。
+そのため、継続して受信バッファーの内容を利用する場合はコピーする。
 
 ## 送信データについて
 `WriteAsync`メンバー関数でデータを通信相手に送信する。
 
-送信データサイズは、`SimpleNamedPipeServer::MAX_DATA_SIZE`, `SimpleNamedPipeClient::MAX_DATA_SIZE` 以下に制限される。これ以上の値を指定した場合は `std::length_error` が発生する。
+送信データサイズは、`MAX_DATA_SIZE` 以下に制限される。これ以上の値を指定した場合は `std::length_error` が発生する。
+
+送信データサイズがテンプレート引数 `BUF_SIZE` を超えた値であっても送信は可能である。
 
 また、上記のデータサイズ制限未満でも実行環境のメモリーリソースによっては、メモリー不足によって動作しない場合があり得る。
 
@@ -171,7 +188,7 @@ catch(winrt::hresult_error& ex){
 
 * API呼び出しのエラーは `winrt::hresult_error` 
 * Closeの後に呼び出した場合は `std::runtime_error` 
-* データサイズがクラスパラメータ`MAX_DATA_SIZE` より大きい場合は `std::length_error`
+* データサイズが`MAX_DATA_SIZE` より大きい場合は `std::length_error`
 
 ```cpp
 try{
@@ -187,7 +204,7 @@ catch(std::runtime_error& )
 }
 catch(std::length_error& )
 {
-     std::wcerr << L"BUF_SIZEより大きいサイズは送信できません" << std::endl;
+     std::wcerr << L"MAX_DATA_SIZEより大きいサイズは送信できません" << std::endl;
 }
 ```
 ## 監視タスクの例外

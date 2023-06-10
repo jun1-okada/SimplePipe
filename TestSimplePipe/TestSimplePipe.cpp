@@ -26,11 +26,9 @@ namespace abt::comm::simple_pipe::test
     public:
         TEST_METHOD(Constants)
         {
+            Assert::AreEqual(MAX_DATA_SIZE, static_cast<size_t>((std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD)));
             Assert::AreEqual(TypicalSimpleNamedPipeServer::BUFFER_SIZE, TYPICAL_BUFFER_SIZE);
-            Assert::AreEqual(TypicalSimpleNamedPipeServer::MAX_DATA_SIZE, static_cast<size_t>((std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD)));
-
             Assert::AreEqual(TypicalSimpleNamedPipeClient::BUFFER_SIZE, TYPICAL_BUFFER_SIZE);
-            Assert::AreEqual(TypicalSimpleNamedPipeClient::MAX_DATA_SIZE, static_cast<size_t>((std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD)));
         }
 
         TEST_METHOD(HelloEcho)
@@ -65,7 +63,7 @@ namespace abt::comm::simple_pipe::test
                 }
             });
 
-            Assert::AreEqual(static_cast<std::wstring_view>(pipeName), static_cast<std::wstring_view>(server.PipeName()));
+            Assert::AreEqual(std::wstring(pipeName.c_str()), std::wstring(server.PipeName().c_str()));
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
@@ -90,18 +88,18 @@ namespace abt::comm::simple_pipe::test
                     break;
                 }
             });
-            Assert::AreEqual(static_cast<std::wstring_view>(pipeName), static_cast<std::wstring_view>(client.PipeName()));
+            Assert::AreEqual(std::wstring(pipeName.c_str()), std::wstring(client.PipeName().c_str()));
 
             WCHAR hello[] = L"HELLO WORLD!";
 
             client.WriteAsync(&hello[0], sizeof(hello)).wait();
 
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                 Assert::Fail();
             }
 
             client.Close();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
             server.Close();
@@ -184,12 +182,12 @@ namespace abt::comm::simple_pipe::test
 
             }
 
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                 Assert::Fail();
             }
 
             client.Close();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
             server.Close();
@@ -276,12 +274,12 @@ namespace abt::comm::simple_pipe::test
 
                 client.WriteAsync(&message[0], message.size() * sizeof(WCHAR)).wait();
 
-                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                     Assert::Fail();
                 }
 
                 client.Close();
-                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                     Assert::Fail();
                 }
                 try {
@@ -383,11 +381,11 @@ namespace abt::comm::simple_pipe::test
 
                 client.WriteAsync(&hello[0], sizeof(hello)).wait();
 
-                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                     Assert::Fail();
                 }
 
-                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                     Assert::Fail();
                 }
 
@@ -426,11 +424,11 @@ namespace abt::comm::simple_pipe::test
 
                 client.WriteAsync(&hello[0], sizeof(hello)).wait();
 
-                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                     Assert::Fail();
                 }
 
-                if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                     Assert::Fail();
                 }
                 serverErrTask.wait();
@@ -468,7 +466,7 @@ namespace abt::comm::simple_pipe::test
                     break;
                 }
             });
-
+ 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
             std::wstring echoMessage;
@@ -508,12 +506,13 @@ namespace abt::comm::simple_pipe::test
                 });
             }
 
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+            //1秒待機して受信データが来なければキャンセル成功
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT != echoComplete.wait(1000)) {
                 Assert::Fail();
             }
-
             client.Close();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
             server.Close();
@@ -581,7 +580,7 @@ namespace abt::comm::simple_pipe::test
             WCHAR dummy[] = L"DUMMY";
 
             Assert::ExpectException<std::length_error>([&]() {
-                client.WriteAsync(&dummy[0], client.MAX_DATA_SIZE + 1).wait();
+                client.WriteAsync(&dummy[0], MAX_DATA_SIZE + 1).wait();
             });
         }
 
@@ -621,8 +620,6 @@ namespace abt::comm::simple_pipe::test
                 }
             });
 
-            Assert::AreEqual(static_cast<std::wstring_view>(pipeName), static_cast<std::wstring_view>(server.PipeName()));
-
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
 
@@ -650,7 +647,7 @@ namespace abt::comm::simple_pipe::test
                 }
             });
             client.WriteAsync(&expected[0], SAMPLE_BYTE_SIZE).wait();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                 Assert::Fail();
             }
             Assert::AreEqual(0, memcmp(&expected[0], &actual[0], SAMPLE_BYTE_SIZE));
@@ -662,13 +659,13 @@ namespace abt::comm::simple_pipe::test
                 expected[i] = std::rand();
             }
             client.WriteAsync(&expected[0], SAMPLE_BYTE_SIZE).wait();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                 Assert::Fail();
             }
             Assert::AreEqual(0, memcmp(&expected[0], &actual[0], SAMPLE_BYTE_SIZE));
 
             client.Close();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
 
@@ -744,12 +741,12 @@ namespace abt::comm::simple_pipe::test
                 client.WriteAsync(m.c_str(), m.size() * sizeof(TCHAR)).wait();
             });
 
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == echoComplete.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                 Assert::Fail();
             }
 
             client.Close();
-            if (concurrency::COOPERATIVE_TIMEOUT_INFINITE == closedEvent.wait(1000)) {
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
             server.Close();
@@ -759,6 +756,166 @@ namespace abt::comm::simple_pipe::test
             std::sort(actual.begin(), actual.end());
             Assert::IsTrue(std::equal(expected.begin(), expected.end(), actual.begin(), actual.end()));
 
+        }
+
+        BEGIN_TEST_METHOD_ATTRIBUTE(TransferMaxDataSize)
+            TEST_PRIORITY(2)
+        END_TEST_METHOD_ATTRIBUTE()
+        TEST_METHOD(TransferMaxDataSize)
+        {
+            if (4 >= sizeof(INT_PTR)) {
+                //32bitプラットフォームではサイズが大きすぎて実行できないので何もしない
+                return;
+            }
+
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event closedEvent;
+
+            using DataVector = std::vector<unsigned int>;
+
+            auto dataCount = MAX_DATA_SIZE / sizeof(DataVector::value_type);
+            auto expected = DataVector(dataCount);
+            int cnt = 0;
+            std::generate(expected.begin(), expected.end(), [&cnt]() {return cnt++; });
+
+            TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    closedEvent.set();
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    ps.WriteAsync(param.readBuffer, param.readedSize).wait();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        serverErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            auto actual = DataVector(dataCount);
+            concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            concurrency::event echoComplete;
+
+            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::DISCONNECTED:
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    if (param.readedSize == expected.size() * sizeof(DataVector::value_type)) {
+                        auto p = reinterpret_cast<const DataVector::value_type*>(param.readBuffer);
+                        std::copy(p, p + expected.size(), actual.begin());
+                    }
+                    echoComplete.set();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        clientErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            client.WriteAsync(&expected[0], expected.size() * sizeof(DataVector::value_type)).wait();
+
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(180 * 1000)) {
+                Assert::Fail();
+            }
+
+            client.Close();
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
+                Assert::Fail();
+            }
+            server.Close();
+
+            serverErrTask.wait();
+            clientErrTask.wait();
+
+            Assert::IsTrue(std::equal(expected.begin(), expected.end(), actual.begin(), actual.end()));
+        }
+
+        TEST_METHOD(WatcherTaskException)
+        {
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event serverErrEvent;
+
+            TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    throw std::exception("server exception");
+                case PipeEventType::RECEIVED:
+                {
+                    ps.WriteAsync(param.readBuffer, param.readedSize).wait();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        serverErrTask = param.errTask.value();
+                    }
+                    serverErrEvent.set();
+                    break;
+                }
+            });
+            concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            concurrency::event clientErrEvent;
+            std::wstring echoMessage;
+
+            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::DISCONNECTED:
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    throw std::exception("client exception");
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        clientErrTask = param.errTask.value();
+                    }
+                    clientErrEvent.set();
+                    break;
+                }
+            });
+
+            WCHAR hello[] = L"HELLO ERROR!";
+            client.WriteAsync(&hello[0], sizeof(hello)).wait();
+
+            concurrency::event* events[] {&serverErrEvent, &clientErrEvent};
+            auto res = concurrency::event::wait_for_multiple(&events[0], _countof(events), true, 1000);
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, res);
+
+            try {
+                serverErrTask.wait();
+                Assert::Fail();
+            }
+            catch (std::exception& ex) {
+                Assert::AreEqual(std::string("server exception"), std::string(ex.what()));
+            }
+            try {
+                clientErrTask.wait();
+                Assert::Fail();
+            }
+            catch (std::exception& ex) {
+                Assert::AreEqual(std::string("client exception"), std::string(ex.what()));
+            }
         }
     };
 }
