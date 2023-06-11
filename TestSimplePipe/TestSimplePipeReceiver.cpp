@@ -14,39 +14,38 @@ namespace abt::comm::simple_pipe::test::receiver
 {
     using namespace abt::comm::simple_pipe;
 
-    //テスト用のパケットヘルパー共用体
-    template<size_t N>
-    union TestPacket {
-        struct {
-            alignas(4) DWORD size;
-            WCHAR data[N];
-        };
-        Packet p;
-    };
-
-    //テスト用パケット生成ヘルパー
-    template<size_t N>
-    TestPacket<N> CreatePacket(const std::wstring msg)
-    {
-        if (msg.size() != N) {
-            throw std::length_error("unmatch size");
-        }
-        TestPacket<N> p;
-        p.size = static_cast<DWORD>((N * sizeof(WCHAR)) + sizeof(Packet::size));
-        std::copy(msg.begin(), msg.end(), p.data);
-        return p;
-    }
-
-    //パケットからメッセージの取り出し
-    std::wstring UnpackMsg(LPCVOID p, size_t s)
-    {
-        return std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR));
-    }
-
-    //abt::comm::simple_pipe::Receiverテストクラス
+    //abt::comm::simple_pipe::SimpleNamedPipeBase::Receiverテストクラス
     TEST_CLASS(TestReceiver)
     {
     public:
+        //テスト用のパケットヘルパー共用体
+        template<size_t N>
+        union TestPacket {
+            struct {
+                alignas(4) DWORD size;
+                WCHAR data[N];
+            };
+            SimpleNamedPipeBase::Packet p;
+        };
+
+        //テスト用パケット生成ヘルパー
+        template<size_t N>
+        static TestPacket<N> CreatePacket(const std::wstring msg)
+        {
+            if (msg.size() != N) {
+                throw std::length_error("unmatch size");
+            }
+            TestPacket<N> p;
+            p.size = static_cast<DWORD>((N * sizeof(WCHAR)) + sizeof(SimpleNamedPipeBase::Packet::size));
+            std::copy(msg.begin(), msg.end(), p.data);
+            return p;
+        }
+
+        //パケットからメッセージの取り出し
+        static std::wstring UnpackMsg(LPCVOID p, size_t s)
+        {
+            return std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR));
+        }
 
         //1受信バッファーに1つのパケット
         TEST_METHOD(SinglePacket)
@@ -54,7 +53,7 @@ namespace abt::comm::simple_pipe::test::receiver
             std::wstring expected = L"ABCDE";
             auto testPacket = CreatePacket<5>(expected);
             std::wstring actual;
-            Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
                 actual = UnpackMsg(p, s);
             });
             receiver.Feed(&testPacket, 14);
@@ -84,7 +83,7 @@ namespace abt::comm::simple_pipe::test::receiver
             }
 
             std::vector<std::wstring> actualValues;
-            Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
                 actualValues.emplace_back(UnpackMsg(p, s));
             });
             receiver.Feed(buffer.get(), totalSize);
@@ -99,7 +98,7 @@ namespace abt::comm::simple_pipe::test::receiver
 
             std::vector<BYTE> buffer;
             std::wstring actual;
-            Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
                 actual = std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR));
             });
 
@@ -133,7 +132,7 @@ namespace abt::comm::simple_pipe::test::receiver
             memcpy(&buffer[packet1.size], &packet2.p, packet2.size);
 
             std::vector<std::wstring> acutals;
-            Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
                 acutals.emplace_back(std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR)));
             });
 
@@ -174,7 +173,7 @@ namespace abt::comm::simple_pipe::test::receiver
             memcpy(p, &packet5.p, packet5.size);
 
             std::vector<std::wstring> acutals;
-            Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
                 acutals.emplace_back(std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR)));
             });
 
