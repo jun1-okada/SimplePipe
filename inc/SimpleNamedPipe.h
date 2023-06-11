@@ -3,8 +3,10 @@
 #include <limits>
 #include <memory>
 #include <functional>
+#include <tuple>
 #include <optional>
 #include <winrt/base.h>
+#include <atomic>
 #include <ppl.h>
 #include <ppltasks.h>
 
@@ -328,15 +330,6 @@ namespace abt::comm::simple_pipe
             }
         };
 #pragma endregion
-        class Flag
-        {
-        private:
-            LONG flag;
-        public:
-            Flag() : flag(0) {}
-            inline bool Test() { return 1 == InterlockedCompareExchange(&flag, 1, 1); }
-            inline bool Set() { return 1 == InterlockedCompareExchange(&flag, 1, 0); }
-        };
     private:
         //パイプハンドル
         winrt::file_handle handlePipe;
@@ -357,7 +350,7 @@ namespace abt::comm::simple_pipe
         //送信バッファーロック
         concurrency::critical_section writeCs;
         //クローズ中フラグ
-        Flag closing;
+        std::atomic_bool closing{false};
         //バッファーサイズ
         const DWORD bufferSize;
 
@@ -498,15 +491,16 @@ namespace abt::comm::simple_pipe
                     }
                     auto index = res - WAIT_OBJECT_0;
                     if (0 <= index && index < handles.size()) {
-                        if (closeEvent.get() == handles[index]) {
+                        auto signaled = handles[index];
+                        if (closeEvent.get() == signaled) {
                             //Close要求イベント
                             break;
                         }
-                        else if (readEvent.get() == handles[index]) {
+                        else if (readEvent.get() == signaled) {
                             //受信イベント
-                            if (!OnSignalRead()) {
-                                //切断検知
-                                //切断コールバック
+                            winrt::check_bool(ResetEvent(signaled));
+                            auto state = OnSignalRead();
+                            if(state.IsDisconn()){
                                 if (!OnDisconnected()) {
                                     //クローズ要求時
                                     break;
@@ -514,7 +508,7 @@ namespace abt::comm::simple_pipe
                             }
                         } else {
                             //継承先のイベントハンドラを呼び出し
-                            if (!OnFireEvent(handles[index])) {
+                            if (!OnFireEvent(signaled)) {
                                 //クローズ要求時
                                 break;
                             }
@@ -529,6 +523,36 @@ namespace abt::comm::simple_pipe
         }
 
     protected:
+        /// <summary>
+        /// 名前付きパイプのGetLastError値のラッパークラス
+        /// </summary>
+        class WrapReadState
+        {
+        private:
+            DWORD lastErr;
+        public:
+            static constexpr DWORD SUCCESSES[]
+            { ERROR_SUCCESS,ERROR_PIPE_LISTENING, ERROR_IO_INCOMPLETE ,ERROR_IO_PENDING , ERROR_PIPE_CONNECTED,ERROR_OPERATION_ABORTED };
+            static constexpr DWORD DISCONNECT[]
+            { ERROR_PIPE_NOT_CONNECTED ,ERROR_NO_DATA,ERROR_BROKEN_PIPE };
+
+            WrapReadState() = delete;
+            inline WrapReadState(DWORD lastErr) : lastErr(lastErr) {}
+            inline const DWORD LastErr() const noexcept { return lastErr; }
+
+            /// <summary>
+            /// エラー値であったらwinrt::hresult_error例外を送出
+            /// </summary>
+            inline void ThrowIfInvalid() {
+                if (IsInvalid()) {
+                    winrt::throw_hresult(HRESULT_FROM_WIN32(lastErr));
+                }
+            }
+            inline bool IsSuccess() const noexcept { return std::find(std::begin(SUCCESSES), std::end(SUCCESSES), lastErr) != std::end(SUCCESSES); }
+            inline bool IsDisconn() const noexcept { return std::find(std::begin(DISCONNECT), std::end(DISCONNECT), lastErr) != std::end(DISCONNECT); }
+            inline bool IsInvalid() const noexcept { return !IsSuccess() && !IsDisconn(); }
+        };
+
         /// <summary>
         /// コンストラクタ
         /// </summary>
@@ -548,7 +572,7 @@ namespace abt::comm::simple_pipe
             }
 
             //受信イベント
-            readEvent = winrt::handle{ CreateEventW(nullptr, false, false, nullptr) };
+            readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(bool{ readEvent });
             readOverlap.hEvent = readEvent.get();
 
@@ -558,7 +582,7 @@ namespace abt::comm::simple_pipe
 
             //引数で指定された継承クラス用のカスタムイベント
             for (size_t i = 0; i < costomEventCount; ++i) {
-                winrt::handle h({ CreateEventW(nullptr, false , false, nullptr) });
+                winrt::handle h({ CreateEventW(nullptr, true , false, nullptr) });
                 winrt::check_bool(bool{ h });
                 customEvents.emplace_back(std::move(h));
             }
@@ -593,7 +617,6 @@ namespace abt::comm::simple_pipe
         /// </summary>
         void ResetReceiver() { receiver.Reset(); }
 
-        /// <summary>
         /// 受信イベント
         /// </summary>
         /// <param name="buffer">受信データ（パケットのヘッダーは含まない）</param>
@@ -622,38 +645,30 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// 非同期受信完了時の処理
         /// </summary>
-        /// <returns>false時は切断状態</returns>
-        virtual bool OnRead()
+        /// <returns>パイプデータ読み込みステータス</returns>
+        virtual WrapReadState OnRead()
         {
             DWORD readSize = 0;
             if (!GetOverlappedResult(handlePipe.get(), &readOverlap, &readSize, FALSE)) {
-                auto lastErr = GetLastError();
-                if (lastErr == ERROR_IO_INCOMPLETE) {
-                    //データ受信を完了していない
-                    return true;
+                auto state = WrapReadState{ GetLastError() };
+                if (state.IsInvalid()) {
+                    //クローズ中のエラーは無視
+                    if (!closing.load()) {
+                        state.ThrowIfInvalid();
+                    }
                 }
-                if (ERROR_PIPE_NOT_CONNECTED == lastErr
-                        || ERROR_BROKEN_PIPE == lastErr
-                        || ERROR_PIPE_LISTENING == lastErr) {
-                    //切断状態
-                    return false;
-                }
-                //クローズ中のエラーは無視
-                if (!closing.Test()) {
-                    winrt::throw_last_error();
-                }
-                return false;
+                return state;
             }
             //データ受信
             receiver.Feed(readBuffer.get(), readSize);
-            return true;
+            return WrapReadState{ ERROR_SUCCESS };
         }
 
         /// <summary>
         /// 非同期受信開始
         /// </summary>
-        /// <returns>false時は切断状態</returns>
-        virtual bool OverappedRead()
+        /// <returns>パイプデータ読み込みステータス</returns>
+        virtual WrapReadState OverappedRead()
         {
             //受信イベントリセット
             readOverlap.Offset = 0;
@@ -661,45 +676,37 @@ namespace abt::comm::simple_pipe
             //受信処理
             // 同期的の受信できる限りは受信処理を継続
             while (ReadFile(handlePipe.get(), readBuffer.get(), bufferSize, nullptr, &readOverlap)) {
-                if (!OnRead()) {
+                auto state = OnRead();
+                if(state.IsDisconn()) {
                     //切断状態となった
-                    return false;
+                    return state;
                 }
                 readOverlap.Offset = 0;
                 readOverlap.OffsetHigh = 0;
             }
             //同期的に受信データを取得できないかエラーの場合
-            auto lastErr = GetLastError();
-            if (ERROR_PIPE_NOT_CONNECTED == lastErr
-                    || ERROR_BROKEN_PIPE == lastErr
-                    || ERROR_PIPE_LISTENING == lastErr) {
-                //切断状態
-                return false;
-            }
-            //I/O完了待ち以外ではエラー
-            if (ERROR_IO_PENDING != lastErr) {
-                if (!closing.Test()) {
-                    winrt::throw_last_error();
+            auto state = WrapReadState{ GetLastError() };
+            if (state.IsInvalid()) {
+                if (!closing.load()) {
+                    state.ThrowIfInvalid();
                 }
-                //クローズ中は例外を送出せずに切断状態を返す
-                return false;
             }
-            return true;
+            return state;
         }
 
         /// <summary>
         /// 受信イベントシグナル時の処理
         /// </summary>
         /// <returns>false時は切断状態</returns>
-        virtual bool OnSignalRead()
+        virtual WrapReadState OnSignalRead()
         {
             //非同期受信完了時処理実行
-            auto connected = OnRead();
-            if (connected) {
+            auto state = OnRead();
+            if (!state.IsDisconn()) {
                 //切断していなければ、次回分の非同期受信処理を実行
-                connected = OverappedRead();
+                state = OverappedRead();
             }
-            return connected;
+            return state;
         }
 
         /// <summary>
@@ -707,13 +714,12 @@ namespace abt::comm::simple_pipe
         /// </summary>
         virtual void ClosePipeHandle()
         {
-            if (closing.Set()) {
-                //すでにClose済み
-                return;
-            }
-            if (handlePipe) {
-                FlushFileBuffers(handlePipe.get());
-                handlePipe.close();
+            bool expected = false;
+            if (closing.compare_exchange_weak(expected, true)) {
+                if (handlePipe) {
+                    FlushFileBuffers(handlePipe.get());
+                    handlePipe.close();
+                }
             }
         }
     public:
@@ -769,9 +775,10 @@ namespace abt::comm::simple_pipe
     private:
         const winrt::hstring pipeName;
         Callback callback;
-        OVERLAPPED connectionOverlap = { 0 };
+        OVERLAPPED connectionOverlap { 0 };
         HANDLE connectionEvent;
         HANDLE disconnectionEvent;
+        std::atomic_int connectedCount{0};
 
         /// <summary>
         /// 次回の接続待ち開始
@@ -782,32 +789,36 @@ namespace abt::comm::simple_pipe
             connectionOverlap = { 0 };
             connectionOverlap.hEvent = connectionEvent;
             if (!ConnectNamedPipe(Handle(), &connectionOverlap)) {
-                auto lastErr = GetLastError();
-                if (ERROR_PIPE_LISTENING != lastErr
-                        && ERROR_IO_PENDING != lastErr
-                        && ERROR_PIPE_CONNECTED != lastErr) {
-                    //ペンディングではない場合の名前付きパイプ接続失敗
-                    winrt::throw_last_error();
+                WrapReadState state{ GetLastError() };
+                if (state.LastErr() == ERROR_PIPE_CONNECTED) {
+                    //すでに接続済み
+                    winrt::check_bool(SetEvent(connectionEvent));
                 }
+                state.ThrowIfInvalid();
             }
         }
 
     protected:
         virtual bool OnFireEvent(HANDLE handle) override
         {
+            winrt::check_bool(ResetEvent(handle));
             bool connected = false;
             if (handle == connectionEvent) {
                 //クライアント接続
-                // 非同期データ受信処理開始
-                connected = OverappedRead();
+                connectedCount.fetch_add(1);
                 //接続イベント
                 OnConnected();
+                // 非同期データ受信処理開始
+                auto state = OverappedRead();
+                connected = !state.IsDisconn();
             }
             else if (handle == disconnectionEvent) {
+                //切断処理実行イベント
                 connected = false;
             }
             if (!connected) {
                 //切断要求/検知したら切断
+                //終了した接続の後始末をして次回接続の待機
                 if (!OnDisconnected()) {
                     //クローズ要求時
                     return false;
@@ -823,9 +834,15 @@ namespace abt::comm::simple_pipe
 
         virtual bool OnDisconnected() override
         {
+            int expceted = 0;
+            if (connectedCount.compare_exchange_weak(expceted, 0)) {
+                //すでに切断済み
+                return true;
+            }
+            connectedCount.fetch_sub(1);
             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
             try {
-                //終了した接続の後始末をして次回接続の待機
+                //切断処理も行う
                 DisconnectInner();
                 //次回接続待ち開始
                 BeginConnect();
@@ -888,7 +905,7 @@ namespace abt::comm::simple_pipe
             // 接続可能クライアント数=1; ローカルマシン接続のみ許可
             HANDLE handle = CreateNamedPipeW(
                 name,
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 BUF_SIZE,
@@ -929,7 +946,12 @@ namespace abt::comm::simple_pipe
         /// </summary>
         virtual void Disconnect()
         {
-            //切断ベントをシグナル
+            int expceted = 0;
+            if (connectedCount.compare_exchange_weak(expceted, 0)) {
+                //すでに切断済み
+                return;
+            }
+            //切断イベントをシグナル
             winrt::check_bool(SetEvent(disconnectionEvent));
         }
 

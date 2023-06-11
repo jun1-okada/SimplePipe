@@ -20,6 +20,12 @@ namespace abt::comm::simple_pipe::test
 {
     using namespace abt::comm::simple_pipe;
 
+    std::wstring hresultToStr(const winrt::hresult_error& e) {
+        std::wostringstream oss;
+        oss << L"HRESULT: " << std::hex << e.code() << " " << e.message().c_str();
+        return oss.str();
+    }
+
     //abt::comm::simple_pipe::Receiverテストクラス
     TEST_CLASS(TestSimplePipe)
     {
@@ -275,12 +281,12 @@ namespace abt::comm::simple_pipe::test
                 client.WriteAsync(&message[0], message.size() * sizeof(WCHAR)).wait();
 
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
-                    Assert::Fail();
+                    Assert::Fail(L"echoComplete.wait timeout");
                 }
 
                 client.Close();
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
-                    Assert::Fail();
+                    Assert::Fail(L"closedEvent.wait timeout");
                 }
                 try {
                     serverErrTask.wait();
@@ -288,7 +294,7 @@ namespace abt::comm::simple_pipe::test
                 }
                 catch (winrt::hresult_error& ex)
                 {
-                    Assert::Fail(ex.message().c_str());
+                    Assert::Fail(hresultToStr(ex).c_str());
                 }
                 catch (std::exception& ex)
                 {
@@ -322,12 +328,21 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> serverErrTask = concurrency::task_from_result();
             concurrency::event closedEvent;
+            concurrency::event connectedEvent;
+
+            int servcerConnectCnt = 0;
+            int servcerDisconnectCnt = 0;
+            int serverWritedCnt1 = 0;
+            int serverWritedCnt2 = 0;
 
             TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::CONNECTED:
+                    connectedEvent.set();
+                    ++servcerConnectCnt;
                     break;
                 case PipeEventType::DISCONNECTED:
+                    ++servcerDisconnectCnt;
                     closedEvent.set();
                     break;
                 case PipeEventType::RECEIVED:
@@ -336,7 +351,9 @@ namespace abt::comm::simple_pipe::test
                     std::wostringstream oss;
                     oss << L"echo: " << m;
                     std::wstring echoMessage = oss.str();
+                    ++serverWritedCnt1;
                     ps.WriteAsync(&echoMessage[0], echoMessage.size() * sizeof(WCHAR)).wait();
+                    ++serverWritedCnt2;
                     ps.Disconnect();
                 }
                 break;
@@ -379,22 +396,29 @@ namespace abt::comm::simple_pipe::test
 
                 WCHAR hello[] = L"HELLO WORLD![1]";
 
-                client.WriteAsync(&hello[0], sizeof(hello)).wait();
-
-                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
-                    Assert::Fail();
+                try {
+                    client.WriteAsync(&hello[0], sizeof(hello)).wait();
+                }
+                catch (winrt::hresult_error& ex) {
+                    Assert::Fail(hresultToStr(ex).c_str());
                 }
 
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
+                    Assert::Fail(L"echoComplete is timeout[1]");
+                }
+
+                Assert::AreEqual(std::wstring(L"echo: HELLO WORLD![1]"), echoMessage);
+
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
+                    Assert::Fail(L"closedEvent is timeout[1]");
                     Assert::Fail();
                 }
 
                 serverErrTask.wait();
                 clientErrTask.wait();
-
-                Assert::AreEqual(std::wstring(L"echo: HELLO WORLD![1]"), echoMessage);
             }
 
+            connectedEvent.reset();
             echoComplete.reset();
             closedEvent.reset();
 
@@ -421,20 +445,24 @@ namespace abt::comm::simple_pipe::test
                 });
 
                 WCHAR hello[] = L"HELLO WORLD![2]";
-
-                client.WriteAsync(&hello[0], sizeof(hello)).wait();
-
-                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
-                    Assert::Fail();
+                try {
+                    client.WriteAsync(&hello[0], sizeof(hello)).wait();
+                }
+                catch (winrt::hresult_error& ex) {
+                    Assert::Fail(hresultToStr(ex).c_str());
                 }
 
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
+                    Assert::Fail(L"echoComplete is timeout[2]");
+                }
+
+                Assert::AreEqual(std::wstring(L"echo: HELLO WORLD![2]"), echoMessage);
+
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
-                    Assert::Fail();
+                    Assert::Fail(L"closedEvent is timeout[2]");
                 }
                 serverErrTask.wait();
                 clientErrTask.wait();
-
-                Assert::AreEqual(std::wstring(L"echo: HELLO WORLD![2]"), echoMessage);
             }
             server.Close();
         }
