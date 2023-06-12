@@ -16,7 +16,7 @@ namespace abt::comm::simple_pipe
     constexpr DWORD TYPICAL_BUFFER_SIZE = 64 * 1024;
     //最少バッファーサイズ
     constexpr DWORD MIN_BUFFER_SIZE = 40;
-    static_assert(TYPICAL_BUFFER_SIZE >= MIN_BUFFER_SIZE);
+    static_assert(TYPICAL_BUFFER_SIZE >= MIN_BUFFER_SIZE, "TYPICAL_BUFFER_SIZE must be greater than or equal to MIN_BUFFER_SIZE");
 
     /// <summary>
     /// イベント種別
@@ -46,9 +46,6 @@ namespace abt::comm::simple_pipe
         const std::optional<concurrency::task<void>> errTask;
     };
 
-    //送信・受信の最大サイズ。ただし、実際はメモリー状況によるのでこの値を保証するものではない。
-    inline static constexpr size_t MAX_DATA_SIZE = (std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD);
-
     /// <summary>
     /// 名前付きパイプ共通ベースクラス
     /// </summary>
@@ -74,12 +71,23 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// データパケット
         /// </summary>
+        struct alignas(4) Header {
+            DWORD size;
+            union {
+                DWORD reserve;
+                struct {
+                    WORD dataOffset;
+                    WORD reserve;
+                } info;
+            };
+        };
         struct Packet
         {
             //size分も含めた全体のサイズ
-            alignas(4) DWORD size;
+            Header head;
             BYTE data[1];
         };
+        inline static constexpr size_t HeaderSize = sizeof(Header);
 
         /// <summary>
         /// 受信バッファー管理クラス
@@ -131,11 +139,20 @@ namespace abt::comm::simple_pipe
                 StateBase(Receiver* owner) : owner{ owner } {}
 
             protected:
+                inline DWORD Limit() const { return owner->limitSize; }
                 inline std::vector<BYTE>& Pool() { return owner->pool; }
-
                 inline Idle& Idle() { return owner->idle; }
                 inline Continuation& Continuation() { return owner->continuation; }
                 inline Insufficient& Insufficient() { return owner->insufficient; }
+                inline void TrhowIfBadHeader(const Header *head) const
+                {
+                    if (head->size < HeaderSize || head->info.dataOffset < HeaderSize) {
+                        throw std::length_error("bad packet header");
+                    }
+                    if ((head->size - HeaderSize) > Limit()) {
+                        throw std::length_error("too long packet size");
+                    }
+                }
 
             public:
                 /// <summary>
@@ -156,21 +173,22 @@ namespace abt::comm::simple_pipe
                 Idle(Receiver* owner) : StateBase(owner) {}
                 virtual std::tuple<StateBase*, Buffer> Feed(Buffer& buffer) override
                 {
-                    if (buffer.Size() < sizeof(Packet::size)) {
+                    if (buffer.Size() < HeaderSize) {
                         //ヘッダー部を完全に受信できていない
                         // Insufficientステートをセットアップして次回以降に続きを受信
                         Insufficient().Continue(buffer.Consume(buffer.Size()));
                         return { &Insufficient(), Buffer(buffer.End(),0) };
                     }
                     const Packet* packet = reinterpret_cast<const Packet*>(buffer.Pointer());
-                    if (packet->size > buffer.Size()) {
+                    TrhowIfBadHeader(&packet->head);
+                    if (packet->head.size > buffer.Size()) {
                         //パケットサイズが受信バッファー残サイズより大きい場合
                         // Continuationをセットアップして続きは次回以降に取得
-                        Continuation().Continue(buffer.Consume(buffer.Size()), packet->size - buffer.Size());
+                        Continuation().Continue(buffer.Consume(buffer.Size()), packet->head.size - buffer.Size());
                         return { &Continuation(), Buffer(buffer.End(),0) };
                     }
                     //1パケット受信。パケットサイズ分を受信データから切り出し。
-                    return { this, buffer.Consume(packet->size) };
+                    return { this, buffer.Consume(packet->head.size) };
                 }
             };
 
@@ -243,13 +261,14 @@ namespace abt::comm::simple_pipe
                     auto prevSize = static_cast<DWORD>(Pool().size());
                     //パケットサイズが分からないので、受信データ全てをプール領域へコピーする
                     Pool().insert(Pool().end(), buffer.Begin(), buffer.End());
-                    if (Pool().size() < sizeof(Packet::size)) {
+                    if (Pool().size() < HeaderSize) {
                         //ヘッダー領域が受信できていない
                         auto consumed = buffer.Consume(buffer.Size());
                         return { this, Buffer(buffer.End(),0) };
                     }
                     const Packet* packet = reinterpret_cast<const Packet*>(&Pool()[0]);
-                    const DWORD remain = packet->size - prevSize;
+                    TrhowIfBadHeader(&packet->head);
+                    const DWORD remain = packet->head.size - prevSize;
                     if (remain > buffer.Size()) {
                         //パケットサイズが受信バッファー残サイズより大きい場合
                         Continuation().Continue(remain - buffer.Size());
@@ -259,7 +278,7 @@ namespace abt::comm::simple_pipe
                     }
                     //完全なパケットが取得できた
                     buffer.Consume(remain);
-                    return { &Idle(),  Buffer(&Pool()[0], packet->size) };
+                    return { &Idle(),  Buffer(&Pool()[0], packet->head.size) };
                 }
 
             };
@@ -275,6 +294,8 @@ namespace abt::comm::simple_pipe
             Insufficient insufficient;
             StateBase* state;
 
+            const DWORD limitSize;
+
         public:
             Receiver() = delete;
             Receiver(Receiver&&) = delete;
@@ -288,8 +309,9 @@ namespace abt::comm::simple_pipe
             /// </summary>
             /// <param name="reserveSize">受信バッファー初期リザーブサイズ</param>
             /// <param name="callback">受信コールバック</param>
-            Receiver(size_t reserveSize, ReceivedCallback callback)
-                : callback(callback)
+            Receiver(size_t reserveSize, DWORD limitSize, ReceivedCallback callback)
+                : limitSize(limitSize)
+                , callback(callback)
                 , idle(this)
                 , continuation(this)
                 , insufficient(this)
@@ -315,8 +337,9 @@ namespace abt::comm::simple_pipe
                     state = std::get<0>(res);
                     if (!std::get<1>(res).Empty()) {
                         //受信パケットデータが存在したら受信コールバクを実行
-                        const Packet* packet = reinterpret_cast<const Packet*>(std::get<1>(res).Pointer());
-                        callback(packet->data, packet->size - sizeof(packet->size));
+                        const BYTE* ptr = std::get<1>(res).Pointer();
+                        const Packet* packet = reinterpret_cast<const Packet*>(ptr);
+                        callback(ptr + packet->head.info.dataOffset , packet->head.size - packet->head.info.dataOffset);
                     }
                 }
             }
@@ -351,8 +374,10 @@ namespace abt::comm::simple_pipe
         concurrency::critical_section writeCs;
         //クローズ中フラグ
         std::atomic_bool closing{false};
-        //バッファーサイズ
+        //送受信バッファーサイズ
         const DWORD bufferSize;
+        //送受信上限サイズ
+        const DWORD limitSize;
 
         /// <summary>
         /// RAIIヘルパー
@@ -557,12 +582,15 @@ namespace abt::comm::simple_pipe
         /// コンストラクタ
         /// </summary>
         /// <param name="handle">パイプハンドル</param>
-        /// <param name="receivedCallback">データ受信コールバック。受信データは関数呼び出し中でのみ有効。</param>
-        SimpleNamedPipeBase(HANDLE handle, DWORD bufferSize, size_t costomEventCount = 0)
+        /// <param name="bufferSize">送信・受信バッファーサイズ</param>
+        /// <param name="limitSize">送信・受信上限サイズ</param>
+        /// <param name="costomEventCount">継承先のOnFireEvent呼び出し対象のイベント作成数。作成したイベントハンドルはCustomEventsで取得する。</param>
+        SimpleNamedPipeBase(HANDLE handle, DWORD bufferSize, DWORD limitSize, size_t costomEventCount = 0)
             : handlePipe(handle)
             , bufferSize(bufferSize)
+            , limitSize(limitSize)
             , readBuffer(std::make_unique<BYTE[]>(bufferSize))
-            , receiver(bufferSize, std::bind(&SimpleNamedPipeBase::OnReceived, this, std::placeholders::_1, std::placeholders::_2))
+            , receiver(bufferSize, limitSize, std::bind(&SimpleNamedPipeBase::OnReceived, this, std::placeholders::_1, std::placeholders::_2))
         {
             if( bufferSize < MIN_BUFFER_SIZE) {
                 throw std::invalid_argument("BUF_SIZE is too short");
@@ -576,7 +604,7 @@ namespace abt::comm::simple_pipe
             winrt::check_bool(bool{ readEvent });
             readOverlap.hEvent = readEvent.get();
 
-            //ハンドルクローズ要求イベント
+            //Close要求イベント
             closeEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(bool{ closeEvent });
 
@@ -736,7 +764,7 @@ namespace abt::comm::simple_pipe
                 //handleが無効
                 winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE));
             }
-            if (size > MAX_DATA_SIZE) {
+            if (size > limitSize) {
                 throw std::length_error("size is too long");
             }
             auto writeSize = static_cast<DWORD>(size);
@@ -745,9 +773,13 @@ namespace abt::comm::simple_pipe
             return concurrency::create_task([this, buffer, writeSize, ct]() {
                 //書き込み出来るのは同時に１つのみ
                 concurrency::critical_section::scoped_lock lock(writeCs);
-                auto packetSize = writeSize + static_cast<DWORD>(sizeof(DWORD));
+                Header header{ 0 };
+                header.size = writeSize + sizeof(header);
+                static_assert((std::numeric_limits<WORD>::max)() >= sizeof(header));
+                header.info.dataOffset = static_cast<WORD>(sizeof(header));
+
                 //データサイズを送信
-                WriteRaw(&packetSize, sizeof(packetSize), ct);
+                WriteRaw(&header, sizeof(header), ct);
                 //データ本体を送信
                 WriteRaw(buffer, writeSize, ct);
             }, concurrency::task_options(ct));
@@ -761,16 +793,20 @@ namespace abt::comm::simple_pipe
         virtual bool Valid() const { return bool{ handlePipe }; }
     };
 
+    //送信・受信の最大サイズ。ただし、実際はメモリー状況によるのでこの値を保証するものではない。
+    inline static constexpr size_t MAX_DATA_SIZE = (std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof SimpleNamedPipeBase::Header);
+
     /// <summary>
     /// 名前付きパイプサーバークラス
     /// </summary>
-    template<DWORD BUF_SIZE>
+    template<DWORD BUF_SIZE, DWORD LIMIT=MAX_DATA_SIZE>
     class SimpleNamedPipeServer : public SimpleNamedPipeBase
     {
-        static_assert(BUF_SIZE >= MIN_BUFFER_SIZE);
+        static_assert(BUF_SIZE >= MIN_BUFFER_SIZE, "BUF_SIZE must be greater than or equal to MIN_BUFFER_SIZE");
+        static_assert(LIMIT <= MAX_DATA_SIZE, "LIMIT must be less than or equal to MAX_DATA_SIZE");
     public:
         inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
-        using Callback = std::function<void(SimpleNamedPipeServer<BUF_SIZE>&, const PipeEventParam&)>;
+        using Callback = std::function<void(SimpleNamedPipeServer<BUF_SIZE, LIMIT>&, const PipeEventParam&)>;
 
     private:
         const winrt::hstring pipeName;
@@ -926,7 +962,7 @@ namespace abt::comm::simple_pipe
         /// <param name="psa">セキュリティディスクリプタ</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeServer(LPCWSTR name, LPSECURITY_ATTRIBUTES psa, Callback callback)
-            : SimpleNamedPipeBase(CreateServerHandle(name, psa), BUF_SIZE, 2)
+            : SimpleNamedPipeBase(CreateServerHandle(name, psa), BUF_SIZE, LIMIT, 2)
             , pipeName(name)
             , callback(callback)
             , connectionEvent{ CustomEvents()[0].get() }
@@ -963,12 +999,13 @@ namespace abt::comm::simple_pipe
     /// <summary>
     /// 名前付きパイプクライアント
     /// </summary>
-    template<DWORD BUF_SIZE>
+    template<DWORD BUF_SIZE, DWORD LIMIT=MAX_DATA_SIZE>
     class SimpleNamedPipeClient : public SimpleNamedPipeBase
     {
-        static_assert(BUF_SIZE >= MIN_BUFFER_SIZE);
+        static_assert(BUF_SIZE >= MIN_BUFFER_SIZE, "BUF_SIZE must be greater than or equal to MIN_BUFFER_SIZE");
+        static_assert(LIMIT <= MAX_DATA_SIZE, "LIMIT must be less than or equal to MAX_DATA_SIZE");
     public:
-        using Callback = std::function<void(SimpleNamedPipeClient<BUF_SIZE>&, const PipeEventParam&)>;
+        using Callback = std::function<void(SimpleNamedPipeClient<BUF_SIZE, LIMIT>&, const PipeEventParam&)>;
         inline static constexpr DWORD BUFFER_SIZE = BUF_SIZE;
     private:
         const winrt::hstring pipeName;
@@ -1033,7 +1070,7 @@ namespace abt::comm::simple_pipe
         /// <param name="name">名前付きパイプ名称</param>
         /// <param name="callback">イベント通知コールバック</param>
         SimpleNamedPipeClient(LPCWSTR name, Callback callback)
-            : SimpleNamedPipeBase(OpendPipeHandle(name), BUF_SIZE)
+            : SimpleNamedPipeBase(OpendPipeHandle(name), BUF_SIZE, LIMIT)
             , pipeName(name)
             , callback(callback)
         {

@@ -32,7 +32,7 @@ namespace abt::comm::simple_pipe::test
     public:
         TEST_METHOD(Constants)
         {
-            Assert::AreEqual(MAX_DATA_SIZE, static_cast<size_t>((std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof DWORD)));
+            Assert::AreEqual(MAX_DATA_SIZE, static_cast<size_t>((std::numeric_limits<DWORD>::max)() - static_cast<DWORD>(sizeof SimpleNamedPipeBase::Header)));
             Assert::AreEqual(TypicalSimpleNamedPipeServer::BUFFER_SIZE, TYPICAL_BUFFER_SIZE);
             Assert::AreEqual(TypicalSimpleNamedPipeClient::BUFFER_SIZE, TYPICAL_BUFFER_SIZE);
         }
@@ -800,6 +800,7 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> serverErrTask = concurrency::task_from_result();
             concurrency::event closedEvent;
+            concurrency::event errEvent;
 
             using DataVector = std::vector<unsigned int>;
 
@@ -825,6 +826,7 @@ namespace abt::comm::simple_pipe::test
                     if (param.errTask) {
                         serverErrTask = param.errTask.value();
                     }
+                    errEvent.set();
                     break;
                 }
             });
@@ -851,14 +853,33 @@ namespace abt::comm::simple_pipe::test
                     if (param.errTask) {
                         clientErrTask = param.errTask.value();
                     }
+                    errEvent.set();
                     break;
                 }
             });
 
             client.WriteAsync(&expected[0], expected.size() * sizeof(DataVector::value_type)).wait();
+            {
+                concurrency::event* waitEvents[] = { &errEvent, &echoComplete };
+                auto idx = concurrency::event::wait_for_multiple(&waitEvents[0], _countof(waitEvents), false, 180 * 1000);
 
-            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(180 * 1000)) {
-                Assert::Fail();
+                if (concurrency::COOPERATIVE_WAIT_TIMEOUT == idx) {
+                    Assert::Fail(L"'timeout: client.WriteAsync");
+                }
+                if (waitEvents[idx] == &errEvent) {
+                    try {
+                        clientErrTask.wait();
+                    }
+                    catch (winrt::hresult_error& ex) {
+                        Assert::Fail(ex.message().c_str());
+                    }
+                    catch (std::exception& ex) {
+                        Assert::Fail(winrt::to_hstring(ex.what()).c_str());
+                    }
+                    catch (...) {
+                        Assert::Fail(L"error!");
+                    }
+                }
             }
 
             client.Close();
@@ -943,6 +964,161 @@ namespace abt::comm::simple_pipe::test
             }
             catch (std::exception& ex) {
                 Assert::AreEqual(std::string("client exception"), std::string(ex.what()));
+            }
+        }
+
+        TEST_METHOD(LimitSizeException)
+        {
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event serverErrEvent;
+
+            SimpleNamedPipeServer<1024,8> server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    ps.WriteAsync(param.readBuffer, param.readedSize).wait();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        serverErrTask = param.errTask.value();
+                    }
+                    serverErrEvent.set();
+                    break;
+                }
+            });
+            concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            std::wstring echoMessage;
+
+            SimpleNamedPipeClient<1024,18> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::DISCONNECTED:
+                    break;
+                case PipeEventType::RECEIVED:
+                    break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        clientErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            {
+                WCHAR data[] = L"0123456789";
+                Assert::ExpectException<std::length_error>([&] {
+                    client.WriteAsync(&data[0], sizeof(data)).wait();
+                });
+            }
+            {
+                WCHAR data[] = L"01234567";
+                client.WriteAsync(&data[0], sizeof(data)).wait();
+            }
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, serverErrEvent.wait(1000));
+            Assert::ExpectException<std::length_error>([&] {
+                serverErrTask.wait();
+            });
+        }
+
+        TEST_METHOD(CreateException)
+        {
+            auto pipeName1 = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event disconnectedEvent;
+
+            TypicalSimpleNamedPipeServer server1(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
+            try {
+                //同名のパイプが既に存在する
+                TypicalSimpleNamedPipeServer server2(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
+                Assert::Fail();
+            }
+            catch (winrt::hresult_error& ex) {
+                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_PIPE_BUSY)), static_cast<int>(ex.code()));
+            }
+
+            TypicalSimpleNamedPipeClient client1(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
+            try {
+                TypicalSimpleNamedPipeClient client2(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
+                Assert::Fail();
+            }
+            catch (winrt::hresult_error& ex) {
+                //クライアントは同時に1つのみ
+                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)), static_cast<int>(ex.code()));
+            }
+
+            auto pipeName2 = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+            try {
+                TypicalSimpleNamedPipeClient client3(pipeName2.c_str(), [&](auto& ps, const auto& param) {});
+                Assert::Fail();
+            }
+            catch (winrt::hresult_error& ex) {
+                //存在しないパイプに接続
+                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)), static_cast<int>(ex.code()));
+            }
+
+        }
+
+        TEST_METHOD(UnreachedException)
+        {
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event disconnectedEvent;
+
+            TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    disconnectedEvent.set();
+                    break;
+                case PipeEventType::RECEIVED:
+                    break;
+                }
+            });
+
+            //未接続の状態で送信
+            WCHAR hello[] = L"HELLO WORLD!";
+            try
+            {
+                server.WriteAsync(&hello[0], sizeof(hello)).wait();
+                Assert::Fail();
+            }
+            catch(winrt::hresult_error ex){
+                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)), static_cast<int>(ex.code()));
+            }
+
+            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {});
+            client.WriteAsync(&hello[0], sizeof(hello)).wait();
+            client.Close();
+            //切断後に送信（クライアント）
+            try
+            {
+                client.WriteAsync(&hello[0], sizeof(hello)).wait();
+                Assert::Fail();
+            }
+            catch (winrt::hresult_error ex) {
+                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)), static_cast<int>(ex.code()));
+            }
+
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, disconnectedEvent.wait(1000));
+            //切断後に送信（サーバー）
+            try
+            {
+                server.WriteAsync(&hello[0], sizeof(hello)).wait();
+                Assert::Fail();
+            }
+            catch (winrt::hresult_error ex) {
+                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)), static_cast<int>(ex.code()));
             }
         }
     };

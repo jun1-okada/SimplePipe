@@ -13,25 +13,118 @@ Windowsのサービスと通常アプリケーションとのあいだのプロ�
 # 使い方
 ヘッダーファイル `SimpleNamedPipe.h` をinclude する。
 
-サーバーとクライアントは、`SimpleNamedPipeServer<BUF_SIZE>` と　`SimpleNamedPipeClient<BUF_SIZE>` の組み合わせで利用すること。
+サーバーとクライアントは、`SimpleNamedPipeServer<BUF_SIZE,LIMIT>` と　`SimpleNamedPipeClient<BUF_SIZE,LIMIT>` の組み合わせで利用すること。
 
-データ長保証のためヘッダー情報を付加しており、この組み合わせでないと正常に動作しない。
-テンプレート引数の `BUF_SIZE` はサーバーとクライアントで異なる値でも動作する。
+データ長保証のためヘッダー情報を付加しており、上記の組み合わせでないと正常に動作しない。
+
+`BUF_SIZE` は通信バッファーサイズを指定する。`MIN_BUFFER_SIZE` 以上でなければコンパイルエラーとなる。この値は通信バッファーサイズとなる。
+
+`LIMIT` は `MAX_DATA_SIZE` 以下である必要があり、そうでない場合はコンパイルエラーとなる。この値は省略可能で`MAX_DATA_SIZE` (uint32_tの上限値-8) と同値となる。
+
+`WriteAsync` のデータサイズと受信時のデータサイズがこの値を上回っていた場合は例外を送出する。受信時にこの例外が発生した場合は接続を破棄する。
+
+テンプレート引数の `BUF_SIZE`, `LIMIT` はサーバーとクライアントで異なる値でも動作する。 
+
+サーバー、クライアントのクラスともにテンプレート引数を推奨値を設定したものが定義済みであり、これらの仕様を推奨する。
+
+- `TypicalSimpleNamedPipeServer` → `SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE, MAX_DATA_SIZE>` 
+- `TypicalSimpleNamedPipeClient` → `SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE, MAX_DATA_SIZE>` 
+
 
 ## サーバー
-`SimpleNamedPipeServer<BUF_SIZE>` でサーバーインスタンスを生成する。
+`SimpleNamedPipeServer<BUF_SIZE, LIMIT>` でサーバーインスタンスを生成する。`LIMIT`の指定は省略可能である。
 
-`BUF_SIZE` は通信バッファーサイズを指定する。
+### コンストラクタ
+- 第1引数: パイプ名称を指定する。
+- 第2引数: `LPSECURITY_ATTRIBUTES` を指定可能。nullptr時は既定のセキュリティ記述子となる。
+- 第3引数: コールバック関数を指定する。
 
-`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合はコンパイルエラーとなる。
-
-第2引数に `LPSECURITY_ATTRIBUTES` を指定可能。nullptr時は既定のセキュリティ記述子となる。
-
-`TypicalSimpleNamedPipeServer` は `SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。この使用を推奨する。
+コンストラクタの例外を補足してエラー対応をおこなう。以下のコード例を参照。
 
 ```cpp
 //パイプサーバーのサンプル
-SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const auto& param) {
+try{
+SimpleNamedPipeServer<4096> pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr, [&](auto& ps, const auto& param) {
+    switch (param.type) {
+    case PipeEventType::CONNECTED:
+        //クライアントが接続した
+        break;
+    case PipeEventType::DISCONNECTED:
+        //クライアントが切断した
+        break;
+    case PipeEventType::RECEIVED:
+        //データ受信
+        break;
+    case PipeEventType::EXCEPTION:
+        //管理スレッドで例外発生
+        break;
+    }
+});
+} catch (winrt::hresult_error& ex) {
+    if(ex.code() == (HRESULT_FROM_WIN32(ERROR_PIPE_BUSY))){
+        //同名のパイプが既に存在する
+    }
+}
+```
+
+### データ送信
+データ送信には `WriteAsync` を使用する。非同期実行するため、戻り値にタスクオブジェクト`concurrency::task<void>`を返す。
+
+送信データサイズは、テンプレート引数の`LIMIT` 以下に制限される。これ以上の値を指定した場合は `std::length_error` が発生する。
+
+送信データサイズがテンプレート引数 `BUF_SIZE` を超えた値であっても送信は可能である。
+
+また、上記のデータサイズ制限未満でも実行環境のメモリーリソースによっては、メモリー不足によって動作しない場合がある。
+
+実際に送信完了するまで、データバッファー変更せずに維持する必要がある。戻り値のタスクオブジェクトで実行状態を確認することができる。
+
+複数のスレッドから同時に実行した場合は、各々の`WriteAsync`は独立して実行され混じることはない。ただし、送信の実行順は保証しない。
+
+- 第1引数: データバッファーポインター
+- 第2引数: データサイズ
+- 第3引数: キャンセルトークン
+- 戻り値: concurrency::task<void>
+
+```cpp
+// 同期的に実行
+try{
+    server.WriteAsync(buffer, size).wait();
+}catch(winrt::hresult_error& ex){
+    if(ex.code() == HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)){
+        //未接続状態
+    }else if(ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)){
+        //パイプハンドルが破棄済み。 このインスタンスは利用できない。
+    }
+}catch(std::length_error& ex){
+    //テンプレート引数 LIMIT より大きなサイズを送信した。
+}
+```
+
+### 接続中のクライアントを切断
+接続中のクライアントを切断するには `Disconnect` を利用する。接続していない場合でも成功する。
+
+切断後も新たな接続を受け入れることができる。
+
+インスタンスが有効な限りは例外を返さない。
+
+```cpp
+server.Disconnect();
+```
+
+### パイプ接続を閉じる
+パイプ接続を閉じて接続中のクライアントは切断するには、`Close` を利用する。
+
+インスタンスが有効な限りは例外を返さない。
+
+```cpp
+server.Close();
+```
+
+### データ受信,イベント受信
+コンストラクタで指定したコールバック関数に、受信データとイベント通知をコールバックする。
+
+```cpp
+TypicalSimpleNamedPipeServer pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr, [&](auto& ps, const auto& param) {
     switch (param.type) {
     case PipeEventType::CONNECTED:
         //クライアントが接続した
@@ -50,9 +143,12 @@ SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const a
         break;
     case PipeEventType::EXCEPTION:
         //管理スレッドで例外発生
-        //このイベント発生時はパイプは終了する
+        //この時点でパイプ通信機能は利用できなくなる。
         if (param.errTask) {
-            try { param.errTask.value().wait(); }
+            //管理タスクの例外を再取得する
+            try { 
+                param.errTask.value().wait(); 
+            }
             catch (winrt::hresult_error& ex) {
                 std::wcout << L"Exception occurred: " << ex.message().c_str() << std::endl;
             }
@@ -63,82 +159,80 @@ SimpleNamedPipeServer<4096> pipeServer(PIPE_NAME, nullptr, [&](auto& ps, const a
                 std::wcout << L"Exception occurred" << std::endl;
             }
         }
-        else {
-            std::wcout << L"Exception occurred" << std::endl;
-        }
         break;
     }
 });
 ```
+#### PipeEventParam::type == PipeEventType::CONNECTED
+クライアントが接続した場合にコールバックする。
+#### PipeEventParam::type == PipeEventType::DISCONNECTED
+クライアントが切断した場合にコールバックする。`Disconnect` を呼び出した場合、クライアントが `Close` した場合に発行する。
+#### PipeEventParam::type == PipeEventType::RECEIVED
+データ受信時にコールバックする。このデータは送信側の `WriteAsync`と1:1 で対応する。
+
+受信データは `PipeEventParam::readBuffer`, 受信サイズは`PipeEventParam::readedSize`に格納されている。
+
+バッファーの内容はこの関数中でしか保証しない。事後に利用する場合はコピーする。
+
+#### PipeEventParam::type == PipeEventType::EXCEPTION
+監視タスク中の例外をコールバックする。このコールバックがあった場合は、インスタンスは利用できない状態となっている。
+
+エラーが発生した管理タスクのタスクオブジェクトが `PipeEventParam::errTask.value() ` に格納されていので、`Task.wait()` 関数から発生した例外を確認できる。
 
 ## クライアント
-`SimpleNamedPipeClient<BUF_SIZE>` でクライアントインスタンスを生成する。
-
-`BUF_SIZE` は通信バッファーサイズを指定する。
-
-`BUF_SIZE` は `MIN_BUFFER_SIZE` 以上が必要で、それに満たない場合はコンパイルエラーとなる。
-
-`TypicalSimpleNamedPipeClient` は `SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE>` のエイリアスとして定義している。この使用を推奨する。
+`SimpleNamedPipeClient<BUF_SIZE,LIMIT>` でクライアントインスタンスを生成する。`LIMIT`の指定は省略可能である。
 
 ```cpp
-SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto&, const auto& param) {
+try{
+    SimpleNamedPipeClient<4096> pipeClient(PIPE_NAME, [&](auto& ps, const auto& param){
     switch (param.type) {
+    case PipeEventType::CONNECTED:
+        //クライアントが接続した
+        break;
     case PipeEventType::DISCONNECTED:
-        //サーバーから切断した。以後は通信不可能。
-        //再接続したい場合は新たにインスタンスを生成する。
-        std::wcout << L"diconnected" << std::endl;
+        //クライアントが切断した
         break;
     case PipeEventType::RECEIVED:
-        //受信データあり
-        {
-            auto message = std::wstring(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
-            std::wcout << message << std::endl;
-            receivedEvent.set();
-        }
+        //データ受信
         break;
     case PipeEventType::EXCEPTION:
         //管理スレッドで例外発生
-        //このイベント発生時はパイプは終了する
-        if (param.errTask) {
-            try { param.errTask.value().wait(); }
-            catch (winrt::hresult_error& ex) {
-                std::wcout << L"Exception occurred: " << ex.message().c_str() << std::endl;
-            }
-            catch (std::exception& ex) {
-                std::wcout << L"Exception occurred: " << ex.what() << std::endl;
-            }
-            catch (...) {
-                std::wcout << L"Exception occurred" << std::endl;
-            }
-        }
-        else {
-            std::wcout << L"Exception occurred" << std::endl;
-        }
         break;
     }
-});
+    });
+}
+catch(winrt::hresult_error& ex){
+    if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
+        //指定したパイプ名を持つパイプが存在しない
+    } else if(HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)){
+        //すでにサーバーには別のクライアントが接続済み
+    }
+}
 ```
-# 利用上の注意点
 
-## 受信バッファーについて
-イベントコールバックの受信バッファーはコールバック中の間だけしか値の保証をしない。
+### データ送信
+データ送信はサーバーと同様のプロトタイプである。ただし、例外についてはサーバーと異なる。
 
-そのため、継続して受信バッファーの内容を利用する場合はコピーする。
+```cpp
+// 同期的に実行
+try{
+    clinet.WriteAsync(buffer, size).wait();
+}catch(winrt::hresult_error& ex){
+    if(ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)){
+        //パイプハンドルが破棄済み。 このインスタンスは利用できない。
+    }
+}catch(std::length_error& ex){
+    //テンプレート引数 LIMIT より大きなサイズを送信した。
+}
+```
+### パイプ接続を閉じる
+サーバーと同様である。
 
-## 送信データについて
-`WriteAsync`メンバー関数でデータを通信相手に送信する。
+### データ受信,イベント受信
+```PipeEventType::CONNECTED``` イベントが存在しない以外は、サーバーと同様である。
 
-送信データサイズは、`MAX_DATA_SIZE` 以下に制限される。これ以上の値を指定した場合は `std::length_error` が発生する。
+# 注意点
 
-送信データサイズがテンプレート引数 `BUF_SIZE` を超えた値であっても送信は可能である。
-
-また、上記のデータサイズ制限未満でも実行環境のメモリーリソースによっては、メモリー不足によって動作しない場合があり得る。
-
-戻り値として `concurrency::task<void>` を返す。 このタスクオブジェクトが完了状態となるまでは、引数で指定したバッファーは破棄・変更などを行わないようにする。
-
-複数のスレッドから同時に実行した場合は、各々の`WriteAsync`は独立して実行され混じることはない。ただし、データの実行順は保証しない。
-
-# 例外処理
 ## winrt::hresult_errorの注意点
 APIのエラーは `winrt::hresult_error` 例外として捕捉できるが、`winrt::hresult_error::code()` によって取得できるエラーコードはHRESULT型となっている。
 
@@ -151,89 +245,11 @@ catch(winrt::hresult_error& ex){
    if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
         std::wcerr << L"接続先が存在しない" << std::endl;
     }
-    else if(ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)){
-        std::wcerr << L"すでに切断されている" << std::endl;
+    else if(ex.code() == HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)){
+        std::wcerr << L"接続済みのクライアントがある" << std::endl;
     }
     else {
         std::wcerr << ex.message().c_str() << std::endl;
     }
  }
-```
-
-## コンストラクタの例外
-`SimpleNamedPipeServer`, `SimpleNamedPipeClient` のコンストラクタでは、`winrt::hresult_error` を送出する。
-
-`winrt::hresult_error::code()` にてエラーコードを取得できる。例えば、接続する名前付きパイプが存在しない場合は、`HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)` となる。
-
-```cpp
-try{
-    TypicalSimpleNamedPipeClient pipeClinet(...);
-    ...
-}
-catch(winrt::hresult_error& ex){
-    if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
-        std::wcerr << L"接続先が存在しない" << std::endl;
-    } 
-    else {
-        //エラーコードに対応したエラーメッセージを出力
-        std::wcerr << ex.message().c_str() << std::endl;
-    }
-}
-```
-
-## WriteAsyncの例外
-データ送信メソッドの `WriteAsync` は非同期実行なので`concurrency::task` を返す。
-
-`concurrency::task::wait` を呼び出すことで、タスクに同期しつつ例外が発生していた場合は、次の例外の再送出が行われる。
-
-* API呼び出しのエラーは `winrt::hresult_error` 
-* Closeの後に呼び出した場合は `std::runtime_error` 
-* データサイズが`MAX_DATA_SIZE` より大きい場合は `std::length_error`
-
-```cpp
-try{
-    pipeClient.WriteAsync(L"HELLO WORLD!", 13 * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
-}
-catch (winrt::hresult_error& ex)
-{
-    std::wcerr << ex.message().c_str() << std::endl;
-}
-catch(std::runtime_error& )
-{
-     std::wcerr << L"接続はすでに閉じられています" << std::endl;
-}
-catch(std::length_error& )
-{
-     std::wcerr << L"MAX_DATA_SIZEより大きいサイズは送信できません" << std::endl;
-}
-```
-## 監視タスクの例外
-インスタンス生成時から、別タスクで監視タスクが実行される。
-
-監視タスク内で例外が発生した場合は、例外通知イベントから例外を検知できる。
-
-エラー発生イベントで発生例外を確認するには、コールバック第2引数の `PipeEventParam::errTask.wait()` で再評価を行い例外を捕捉する。
-```cpp
-TypicalSimpleNamedPipeClient pipeClient(PIPE_NAME, [&](auto&, const auto& param) {
-    // ...
-    case PipeEventType::EXCEPTION:
-        //監視タスクで例外発生
-        if (param.errTask) {
-            try { param.errTask.value().wait(); }
-            catch(winrt::hresult_error& ex){
-                std::wcout << L"Exception occurred: " << ex.message().c_str() << std::endl;
-            }
-            catch (std::exception& ex) {
-                std::wcout << L"Exception occurred: " << ex.what() << std::endl;
-            }
-            catch (...) {
-                std::wcout << L"Exception occurred" << std::endl;
-            }
-        }
-        else {
-            std::wcout << L"Exception occurred" << std::endl;
-        }
-        break;
-    }
-});
 ```
