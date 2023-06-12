@@ -22,7 +22,7 @@ namespace abt::comm::simple_pipe::test::receiver
         template<size_t N>
         union TestPacket {
             struct {
-                alignas(4) DWORD size;
+                SimpleNamedPipeBase::Header header;
                 WCHAR data[N];
             };
             SimpleNamedPipeBase::Packet p;
@@ -36,7 +36,9 @@ namespace abt::comm::simple_pipe::test::receiver
                 throw std::length_error("unmatch size");
             }
             TestPacket<N> p;
-            p.size = static_cast<DWORD>((N * sizeof(WCHAR)) + sizeof(SimpleNamedPipeBase::Packet::size));
+            p.header = { 0 };
+            p.header.size = static_cast<DWORD>((N * sizeof(WCHAR)) + SimpleNamedPipeBase::HeaderSize);
+            p.header.info.dataOffset = SimpleNamedPipeBase::HeaderSize;
             std::copy(msg.begin(), msg.end(), p.data);
             return p;
         }
@@ -47,16 +49,21 @@ namespace abt::comm::simple_pipe::test::receiver
             return std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR));
         }
 
+        TEST_METHOD(Constants)
+        {
+            Assert::AreEqual(sizeof(SimpleNamedPipeBase::Packet::head), 8ull);
+        }
+
         //1受信バッファーに1つのパケット
         TEST_METHOD(SinglePacket)
         {
             std::wstring expected = L"ABCDE";
             auto testPacket = CreatePacket<5>(expected);
             std::wstring actual;
-            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, 1024, [&](const auto p, auto s) {
                 actual = UnpackMsg(p, s);
             });
-            receiver.Feed(&testPacket, 14);
+            receiver.Feed(&testPacket, testPacket.p.head.size);
 
             Assert::AreEqual(expected, actual);
         }
@@ -72,18 +79,18 @@ namespace abt::comm::simple_pipe::test::receiver
                 CreatePacket<5>(L"VWXYZ"),
             };
             std::vector<std::wstring> expectedValues;
-            size_t totalSize = testPackets[0].size * _countof(testPackets);
+            size_t totalSize = testPackets[0].header.size * _countof(testPackets);
             std::unique_ptr<BYTE[]> buffer = std::make_unique<BYTE[]>(totalSize);
             BYTE* dst = buffer.get();
             for (const auto& p : testPackets) {
-                auto len = p.size;
+                auto len = p.header.size;
                 memcpy(dst, &p, len);
                 dst += len;
                 expectedValues.emplace_back(std::wstring(p.data, 0, _countof(p.data)));
             }
 
             std::vector<std::wstring> actualValues;
-            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, 1024, [&](const auto p, auto s) {
                 actualValues.emplace_back(UnpackMsg(p, s));
             });
             receiver.Feed(buffer.get(), totalSize);
@@ -98,11 +105,11 @@ namespace abt::comm::simple_pipe::test::receiver
 
             std::vector<BYTE> buffer;
             std::wstring actual;
-            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, 1024, [&](const auto p, auto s) {
                 actual = std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR));
             });
 
-            auto remain = packet.size;
+            auto remain = packet.header.size;
             const BYTE* p = reinterpret_cast<const BYTE*>(&packet);
             constexpr DWORD fragmentSize = 8;
             while (remain > 0) {
@@ -126,13 +133,13 @@ namespace abt::comm::simple_pipe::test::receiver
             };
 
 
-            auto totalSize = packet1.size + packet2.size;
+            auto totalSize = packet1.header.size + packet2.header.size;
             auto buffer = std::make_unique<BYTE[]>(totalSize);
-            memcpy(&buffer[0], &packet1.p, packet1.size);
-            memcpy(&buffer[packet1.size], &packet2.p, packet2.size);
+            memcpy(&buffer[0], &packet1.p, packet1.header.size);
+            memcpy(&buffer[packet1.header.size], &packet2.p, packet2.header.size);
 
             std::vector<std::wstring> acutals;
-            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, 1024, [&](const auto p, auto s) {
                 acutals.emplace_back(std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR)));
             });
 
@@ -163,17 +170,17 @@ namespace abt::comm::simple_pipe::test::receiver
             };
 
 
-            auto totalSize = packet1.size + packet2.size + packet3.size + packet4.size + packet5.size;
+            auto totalSize = packet1.header.size + packet2.header.size + packet3.header.size + packet4.header.size + packet5.header.size;
             auto buffer = std::make_unique<BYTE[]>(totalSize);
             auto p = &buffer[0];
-            memcpy(p, &packet1.p, packet1.size); p += packet1.size;
-            memcpy(p, &packet2.p, packet2.size); p += packet2.size;
-            memcpy(p, &packet3.p, packet3.size); p += packet3.size;
-            memcpy(p, &packet4.p, packet4.size); p += packet4.size;
-            memcpy(p, &packet5.p, packet5.size);
+            memcpy(p, &packet1.p, packet1.header.size); p += packet1.header.size;
+            memcpy(p, &packet2.p, packet2.header.size); p += packet2.header.size;
+            memcpy(p, &packet3.p, packet3.header.size); p += packet3.header.size;
+            memcpy(p, &packet4.p, packet4.header.size); p += packet4.header.size;
+            memcpy(p, &packet5.p, packet5.header.size);
 
             std::vector<std::wstring> acutals;
-            SimpleNamedPipeBase::Receiver receiver(1024, [&](const auto p, auto s) {
+            SimpleNamedPipeBase::Receiver receiver(1024, 1024, [&](const auto p, auto s) {
                 acutals.emplace_back(std::wstring(reinterpret_cast<LPCWSTR>(p), 0, s / sizeof(WCHAR)));
             });
 
@@ -188,6 +195,19 @@ namespace abt::comm::simple_pipe::test::receiver
             }
 
             Assert::IsTrue(std::equal(expected.begin(), expected.end(), acutals.begin(), acutals.end()));
+        }
+
+        TEST_METHOD(LimitSizePckets)
+        {
+            std::wstring expected = L"ABCDE";
+            auto testPacket = CreatePacket<5>(expected);
+            std::wstring actual;
+            SimpleNamedPipeBase::Receiver receiver(1024, 8, [&](const auto p, auto s) {
+                actual = UnpackMsg(p, s);
+            });
+            Assert::ExpectException<std::length_error>([&]() {
+                receiver.Feed(&testPacket, testPacket.p.head.size);
+            });
         }
     };
 }
