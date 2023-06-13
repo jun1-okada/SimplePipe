@@ -881,7 +881,7 @@ namespace abt::comm::simple_pipe
         /// <param name="size">送信サイズ</param>
         /// <param name="ct">キャンセルトークン</param>
         /// <returns>非同期タスク</returns>
-        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct)
         {
             if (!handlePipe) {
                 //handleが無効
@@ -935,6 +935,11 @@ namespace abt::comm::simple_pipe
                     }
                 }
             }, concurrency::task_options(ct));
+        }
+
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size)
+        {
+            return WriteAsync(buffer, size, concurrency::cancellation_token::none());
         }
 
         virtual void Close()

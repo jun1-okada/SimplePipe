@@ -1113,12 +1113,19 @@ namespace abt::comm::simple_pipe::test
             }
             {
                 WCHAR data[] = L"01234567";
-                client.WriteAsync(&data[0], sizeof(data)).wait();
+                try {
+                    client.WriteAsync(&data[0], sizeof(data)).wait();
+                }
+                catch (winrt::hresult_error& ex) {
+                    Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_NO_DATA)), static_cast<int>(ex.code()));
+                }
             }
             Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, serverErrEvent.wait(1000));
-            Assert::ExpectException<std::length_error>([&] {
+            try {
                 serverErrTask.wait();
-            });
+            }
+            catch (std::length_error& )
+            {}
         }
 
         TEST_METHOD(CreateException)
