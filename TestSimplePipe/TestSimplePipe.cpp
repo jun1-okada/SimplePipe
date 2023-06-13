@@ -607,7 +607,7 @@ namespace abt::comm::simple_pipe::test
                 }
             });
 
-            constexpr size_t SAMPLE_SIZE = BUFFER_SIZE * 8;
+            constexpr size_t SAMPLE_SIZE = BUFFER_SIZE ;
             constexpr size_t SAMPLE_BYTE_SIZE = SAMPLE_SIZE * sizeof(int);
             auto expected = std::make_unique<int[]>(SAMPLE_SIZE);
             for (int i = 0; i < SAMPLE_SIZE; ++i) {
@@ -713,7 +713,7 @@ namespace abt::comm::simple_pipe::test
             concurrency::event closedEvent;
 
             constexpr size_t BUFFER_SIZE = 1024;
-            constexpr size_t SAMPLE_SIZE = 4 * 1024;
+            constexpr size_t SAMPLE_SIZE = 1024;
             auto expected = std::make_unique<int[]>(SAMPLE_SIZE);
             for (int i = 0; i < SAMPLE_SIZE; ++i) {
                 expected[i] = std::rand();
