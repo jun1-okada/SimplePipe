@@ -64,6 +64,7 @@ SimpleNamedPipeServer<4096> pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr, 
     if(ex.code() == (HRESULT_FROM_WIN32(ERROR_PIPE_BUSY))){
         //同名のパイプが既に存在する
     }
+    //他のエラーについてはWin32エラーコードを参照
 }
 ```
 
@@ -92,9 +93,12 @@ try{
 }catch(winrt::hresult_error& ex){
     if(ex.code() == HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)){
         //未接続状態
+    }else if(ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA)){
+        //パイプが閉じられた
     }else if(ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)){
         //パイプハンドルが破棄済み。 このインスタンスは利用できない。
     }
+    //他のエラーについてはWin32エラーコードを参照
 }catch(std::length_error& ex){
     //テンプレート引数 LIMIT より大きなサイズを送信した。
 }
@@ -207,24 +211,13 @@ catch(winrt::hresult_error& ex){
     } else if(HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)){
         //すでにサーバーには別のクライアントが接続済み
     }
+    //他のエラーについてはWin32エラーコードを参照
 }
 ```
 
 ### データ送信
-データ送信はサーバーと同様のプロトタイプである。ただし、例外についてはサーバーと異なる。
+データ送信はサーバーと同様のプロトタイプである。
 
-```cpp
-// 同期的に実行
-try{
-    clinet.WriteAsync(buffer, size).wait();
-}catch(winrt::hresult_error& ex){
-    if(ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)){
-        //パイプハンドルが破棄済み。 このインスタンスは利用できない。
-    }
-}catch(std::length_error& ex){
-    //テンプレート引数 LIMIT より大きなサイズを送信した。
-}
-```
 ### パイプ接続を閉じる
 サーバーと同様である。
 
@@ -241,7 +234,7 @@ Win32エラーコードと比較する際は `HRESULT_FROM_WIN32` マクロで�
 ```cpp
 try{
     ...
-catch(winrt::hresult_error& ex){
+}catch(winrt::hresult_error& ex){
    if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
         std::wcerr << L"接続先が存在しない" << std::endl;
     }
@@ -249,7 +242,8 @@ catch(winrt::hresult_error& ex){
         std::wcerr << L"接続済みのクライアントがある" << std::endl;
     }
     else {
+        //他のエラー
         std::wcerr << ex.message().c_str() << std::endl;
     }
- }
+}
 ```

@@ -67,32 +67,10 @@ namespace abt::comm::simple_pipe
         }
 
 #pragma region Receiver
-        using ReceivedCallback = std::function<void(LPCVOID, size_t)>;
-        /// <summary>
-        /// データパケット
-        /// </summary>
-        struct alignas(4) Header {
-            DWORD size;
-            union {
-                DWORD reserve;
-                struct {
-                    WORD dataOffset;
-                    WORD reserve;
-                } info;
-            };
-        };
-        struct Packet
-        {
-            //size分も含めた全体のサイズ
-            Header head;
-            BYTE data[1];
-        };
-        inline static constexpr size_t HeaderSize = sizeof(Header);
-
         /// <summary>
         /// 受信バッファー管理クラス
         /// </summary>
-        class Buffer
+        class Buffer final
         {
         private:
             const BYTE* sp;
@@ -102,11 +80,11 @@ namespace abt::comm::simple_pipe
                 : sp{ reinterpret_cast<const BYTE*>(buffer) }
                 , ep{ reinterpret_cast<const BYTE*>(buffer) + size }
             {}
-            const BYTE* Begin() const { return sp; }
-            const BYTE* End() const { return ep; }
+            const BYTE* Begin() const { assert(sp != nullptr); return sp; }
+            const BYTE* End() const { assert(ep != nullptr); return ep; }
             bool Empty() const { return sp == ep; }
-            const BYTE* Pointer() const { return sp; }
-            size_t Size() const { return std::distance(sp, ep); }
+            const BYTE* Pointer() const { assert(sp != nullptr); return sp; }
+            size_t Size() const { assert(sp != nullptr); return std::distance(sp, ep); }
             Buffer Consume(size_t size)
             {
                 if (size > Size()) {
@@ -119,9 +97,67 @@ namespace abt::comm::simple_pipe
         };
 
         /// <summary>
+        /// データパケット
+        /// </summary>
+        struct alignas(4) Header {
+            DWORD size;
+            union {
+                DWORD reserve;
+                struct {
+                    WORD dataOffset;    //パケットの先頭からデータまでのオフセット
+                    WORD startBit : 1;
+                    WORD endBit : 1;
+                    WORD cancelBit : 1;
+                    WORD reserve : 13;
+                } info;
+            };
+            inline size_t DataOffset() const { return info.dataOffset; }
+            inline size_t DataSize() const
+            {
+                assert(size >= info.dataOffset);
+                return size - info.dataOffset;
+            }
+            inline bool IsStart() const { return info.startBit != 0; }
+            inline bool IsEnd() const { return info.endBit != 0; }
+            inline bool IsCancel() const { return info.cancelBit != 0; }
+            static inline Header Create(DWORD dataSize, bool startBit, bool endBit)
+            {
+                Header header{ 0 };
+                header.size = static_cast<DWORD>(dataSize + HeaderSize);
+                header.info.dataOffset = HeaderSize;
+                header.info.startBit = startBit ? 1 : 0;
+                header.info.endBit = endBit ? 1 : 0;
+                return header;
+            }
+            static inline Header CreateCancel()
+            {
+                Header header{ 0 };
+                header.size = HeaderSize;
+                header.info.dataOffset = HeaderSize;
+                header.info.cancelBit = 1;
+                return header;
+            }
+        };
+        inline static constexpr size_t HeaderSize = sizeof(Header);
+        static_assert((std::numeric_limits<WORD>::max)() >= HeaderSize);
+
+        struct Packet
+        {
+            //size分も含めた全体のサイズ
+            Header head;
+            BYTE data[1];
+            Buffer Data() const
+            {
+                return Buffer(reinterpret_cast<const BYTE*>(this) + head.DataOffset(), head.DataSize());
+            }
+        };
+
+        using ReceivedCallback = std::function<void(const Packet*)> ;
+
+        /// <summary>
         /// 受信データ復号クラス
         /// </summary>
-        class Receiver
+        class Receiver final
         {
         private:
             class Idle;
@@ -339,7 +375,7 @@ namespace abt::comm::simple_pipe
                         //受信パケットデータが存在したら受信コールバクを実行
                         const BYTE* ptr = std::get<1>(res).Pointer();
                         const Packet* packet = reinterpret_cast<const Packet*>(ptr);
-                        callback(ptr + packet->head.info.dataOffset , packet->head.size - packet->head.info.dataOffset);
+                        callback(packet);
                     }
                 }
             }
@@ -352,6 +388,98 @@ namespace abt::comm::simple_pipe
                 state = &idle;
             }
         };
+
+        /// <summary>
+        /// データを複数パケットに変換
+        /// </summary>
+        class Serializer final
+        {
+        private:
+            Buffer buffer;
+            const DWORD splitSize;
+            bool beginning{ true };
+        public:
+            Serializer() = delete;
+            Serializer(Serializer&&) = delete;
+            Serializer(const Serializer&) = delete;
+            Serializer& operator=(Serializer&&) = delete;
+            Serializer& operator=(const Serializer&) = delete;
+            explicit Serializer(Buffer buffer, DWORD splitSize)
+                : buffer{ buffer }, splitSize{ splitSize } {};
+
+            std::tuple<Buffer, Header> Next()
+            {
+                if (buffer.Empty()) {
+                    return { buffer, {0} };
+                }
+                auto size = (std::min)(static_cast<size_t>(splitSize), buffer.Size());
+                auto fragment = buffer.Consume(size);
+                auto header = Header::Create(static_cast<DWORD>(size), beginning, buffer.Empty());
+                beginning = buffer.Empty();
+                return { fragment, header };
+            }
+        };
+
+        /// <summary>
+        /// 複数パケットからデータに変換
+        /// </summary>
+        class Deserializer final
+        {
+        private:
+            bool beginning{ true };
+            std::vector<BYTE> pool;
+            const size_t limitSize;
+            std::function<void(Buffer)> completed;
+        public:
+            Deserializer() = delete;
+            Deserializer(Deserializer&&) = delete;
+            Deserializer(const Deserializer&) = delete;
+            Deserializer& operator=(Serializer&&) = delete;
+            Deserializer& operator=(const Deserializer&) = delete;
+            Deserializer(size_t reserveSize, size_t limitSize, std::function<void(Buffer)> completed)
+                : limitSize(limitSize)
+                , completed(completed)
+            {
+                if (!completed) {
+                    throw std::invalid_argument("bad callback error");
+                }
+                pool.reserve(reserveSize);
+            }
+
+            void Reset()
+            {
+                beginning = true;
+            }
+
+            bool Feed(const Packet* packet)
+            {
+                if (packet->head.IsCancel()) {
+                    beginning = true;
+                    pool.clear();
+                    return false;
+                }
+                if (beginning) {
+                    pool.clear();
+                    //最初のパケット
+                    if (!packet->head.IsStart()) {
+                        //データに矛盾
+                        throw std::runtime_error("inconsistent feed data");
+                    }
+                    beginning = false;
+                }
+                auto packetData = packet->Data();
+                if(limitSize < pool.size() + packetData.Size()){
+                    throw std::length_error("size is too long");
+                }
+                pool.insert(pool.end(), packetData.Begin(), packetData.End());
+                if (packet->head.IsEnd()) {
+                    beginning = true;
+                    completed(Buffer(&pool[0], pool.size()));
+                }
+                return true;
+            }
+        };
+
 #pragma endregion
     private:
         //パイプハンドル
@@ -370,6 +498,8 @@ namespace abt::comm::simple_pipe
         concurrency::task<void> watcherTask;
         //受信パケット処理
         Receiver receiver;
+        //デシリアライズ処理
+        Deserializer deserializer;
         //送信バッファーロック
         concurrency::critical_section writeCs;
         //クローズ中フラグ
@@ -436,24 +566,13 @@ namespace abt::comm::simple_pipe
         /// <param name="buffer">書き込みバッファー</param>
         /// <param name="size">バッファーサイズ</param>
         /// <param name="ct">キャンセルトークン</param>
-        void WriteRaw(LPCVOID buffer, DWORD size, concurrency::cancellation_token ct)
+        /// <returns>キャンセル時はfalse</returns>
+        bool WriteRaw(LPCVOID buffer, DWORD size, winrt::handle& cancelEvent)
         {
-            winrt::handle cancelEvent{CreateEventW(nullptr, true, false, nullptr)};
-            concurrency::cancellation_token_registration cookie;
-            if (ct.is_cancelable()) {
-                //キャンセル可能な場合のイベントディスパッチ処理
-                cookie = ct.register_callback([&cancelEvent, ct, &cookie]() {
-                    winrt::check_bool(SetEvent(cancelEvent.get()));
-                    try {
-                        ct.deregister_callback(cookie);
-                    }
-                    catch (...) {}
-                });
-            }
             //オーバーラップ構造体の設定
             WriteOverlapTag tag{ this, Buffer(buffer, size), ERROR_SUCCESS, true};
+            OVERLAPPED overlapped = { 0 };
             while (!tag.Completed() && tag.success) {
-                OVERLAPPED overlapped = { 0 };
                 //一度に送信するサイズをコンストラクタ引数のbufferSizeまでに制限
                 DWORD writeSize = (std::min)(static_cast<DWORD>(tag.buffer.Size()), bufferSize);
                 //WriteFileExはhEventは利用しないので、ワーク領域のポインターを格納する
@@ -464,13 +583,14 @@ namespace abt::comm::simple_pipe
                 if (WAIT_OBJECT_0 == res) {
                     //非同期書き込みをキャンセル
                     CancelIoEx(handlePipe.get(), &overlapped);
-                    concurrency::cancel_current_task();
-                    break;
                 }
                 else if (WAIT_IO_COMPLETION == res) {
                     // I/O完了
                     if (!tag.success) {
-                        if (ERROR_SUCCESS != tag.lastErr) {
+                        if (ERROR_OPERATION_ABORTED == tag.lastErr) {
+                            return false;
+                        }
+                        else if (ERROR_SUCCESS != tag.lastErr) {
                             //Win32エラーが発生していたら例外送出
                             winrt::throw_hresult(HRESULT_FROM_WIN32(tag.lastErr));
                         }
@@ -482,9 +602,7 @@ namespace abt::comm::simple_pipe
                     winrt::throw_last_error();
                 }
             }
-            if (ct.is_cancelable()) {
-                ct.deregister_callback(cookie);
-            }
+            return true;
         }
 
         /// <summary>
@@ -547,6 +665,11 @@ namespace abt::comm::simple_pipe
             });
         }
 
+        void OnReceivedPacket(const Packet* packet)
+        {
+            deserializer.Feed(packet);
+        }
+
     protected:
         /// <summary>
         /// 名前付きパイプのGetLastError値のラッパークラス
@@ -557,9 +680,9 @@ namespace abt::comm::simple_pipe
             DWORD lastErr;
         public:
             static constexpr DWORD SUCCESSES[]
-            { ERROR_SUCCESS,ERROR_PIPE_LISTENING, ERROR_IO_INCOMPLETE ,ERROR_IO_PENDING , ERROR_PIPE_CONNECTED,ERROR_OPERATION_ABORTED };
+            { ERROR_SUCCESS, ERROR_PIPE_LISTENING, ERROR_IO_INCOMPLETE ,ERROR_IO_PENDING , ERROR_PIPE_CONNECTED,ERROR_OPERATION_ABORTED };
             static constexpr DWORD DISCONNECT[]
-            { ERROR_PIPE_NOT_CONNECTED ,ERROR_NO_DATA,ERROR_BROKEN_PIPE };
+            { ERROR_PIPE_NOT_CONNECTED, ERROR_PIPE_LISTENING, ERROR_NO_DATA, ERROR_BROKEN_PIPE };
 
             WrapReadState() = delete;
             inline WrapReadState(DWORD lastErr) : lastErr(lastErr) {}
@@ -590,7 +713,8 @@ namespace abt::comm::simple_pipe
             , bufferSize(bufferSize)
             , limitSize(limitSize)
             , readBuffer(std::make_unique<BYTE[]>(bufferSize))
-            , receiver(bufferSize, limitSize, std::bind(&SimpleNamedPipeBase::OnReceived, this, std::placeholders::_1, std::placeholders::_2))
+            , receiver(bufferSize, limitSize, std::bind(&SimpleNamedPipeBase::OnReceivedPacket, this, std::placeholders::_1))
+            , deserializer(bufferSize, limitSize, std::bind(&SimpleNamedPipeBase::OnReceived, this, std::placeholders::_1))
         {
             if( bufferSize < MIN_BUFFER_SIZE) {
                 throw std::invalid_argument("BUF_SIZE is too short");
@@ -647,9 +771,8 @@ namespace abt::comm::simple_pipe
 
         /// 受信イベント
         /// </summary>
-        /// <param name="buffer">受信データ（パケットのヘッダーは含まない）</param>
-        /// <param name="size">受信データサイズ</param>
-        virtual void OnReceived(LPCVOID buffer, size_t size) = 0;
+        /// <param name="buffer">受信データ</param>
+        virtual void OnReceived(Buffer buffer) = 0;
 
         /// <summary>
         /// 切断イベント
@@ -758,7 +881,7 @@ namespace abt::comm::simple_pipe
         /// <param name="size">送信サイズ</param>
         /// <param name="ct">キャンセルトークン</param>
         /// <returns>非同期タスク</returns>
-        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct = concurrency::cancellation_token::none())
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size, concurrency::cancellation_token ct)
         {
             if (!handlePipe) {
                 //handleが無効
@@ -767,30 +890,70 @@ namespace abt::comm::simple_pipe
             if (size > limitSize) {
                 throw std::length_error("size is too long");
             }
-            auto writeSize = static_cast<DWORD>(size);
-
             //非同期時の送信完了待機のタスク
-            return concurrency::create_task([this, buffer, writeSize, ct]() {
+            return concurrency::create_task([this, buffer, size, ct]() {
+                std::atomic_bool cancelFlag{false};
+                concurrency::cancellation_token_registration cookie;
+                if (ct.is_cancelable()) {
+                    //キャンセル可能な場合のイベントディスパッチ処理
+                    cookie = ct.register_callback([&cancelFlag, ct, &cookie]() {
+                        cancelFlag.store(true);
+                        try {
+                            ct.deregister_callback(cookie);
+                        }
+                        catch (...) {}
+                    });
+                }
                 //書き込み出来るのは同時に１つのみ
                 concurrency::critical_section::scoped_lock lock(writeCs);
-                Header header{ 0 };
-                header.size = writeSize + sizeof(header);
-                static_assert((std::numeric_limits<WORD>::max)() >= sizeof(header));
-                header.info.dataOffset = static_cast<WORD>(sizeof(header));
-
-                //データサイズを送信
-                WriteRaw(&header, sizeof(header), ct);
-                //データ本体を送信
-                WriteRaw(buffer, writeSize, ct);
+                //バッファーサイズ単位に分割して送信
+                Serializer serialier(Buffer(buffer, size), bufferSize);
+                winrt::handle dummyEvent{CreateEventW(nullptr, true, false, nullptr)};
+                while(!cancelFlag.load()){
+                    auto [packetData, header] = serialier.Next();
+                    if (packetData.Empty()) {
+                        //完了
+                        break;
+                    }
+                    //ヘッダーを送信
+                    WriteRaw(&header, sizeof(header), dummyEvent);
+                    //データ本体を送信
+                    WriteRaw(packetData.Pointer(), static_cast<DWORD>(packetData.Size()), dummyEvent);
+#ifdef SNP_TEST_MODE
+                    //テスト用の定義
+                    if (onWritePacket) {
+                        onWritePacket();
+                    }
+#endif
+                }
+                if (cancelFlag.load()) {
+                    //キャンセル発生を送信
+                    auto cancelHeader = Header::CreateCancel();
+                    WriteRaw(&cancelHeader, sizeof(cancelHeader), dummyEvent);
+                    if (ct.is_cancelable()) {
+                        concurrency::cancel_current_task();
+                    }
+                }
             }, concurrency::task_options(ct));
+        }
+
+        virtual concurrency::task<void> WriteAsync(LPCVOID buffer, size_t size)
+        {
+            return WriteAsync(buffer, size, concurrency::cancellation_token::none());
         }
 
         virtual void Close()
         {
             winrt::check_bool(SetEvent(closeEvent.get()));
+            watcherTask.wait();
         }
 
         virtual bool Valid() const { return bool{ handlePipe }; }
+
+#ifdef SNP_TEST_MODE
+        //テスト用の定義
+        std::function<void(void)> onWritePacket;
+#endif
     };
 
     //送信・受信の最大サイズ。ただし、実際はメモリー状況によるのでこの値を保証するものではない。
@@ -863,9 +1026,9 @@ namespace abt::comm::simple_pipe
             return true;
         }
 
-        virtual void OnReceived(LPCVOID buffer, size_t size) override
+        virtual void OnReceived(Buffer buffer) override
         {
-            callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer, size });
+            callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer.Pointer(), buffer.Size()});
         }
 
         virtual bool OnDisconnected() override
@@ -1012,9 +1175,9 @@ namespace abt::comm::simple_pipe
         const Callback callback;
 
     protected:
-        virtual void OnReceived(LPCVOID buffer, size_t size) override
+        virtual void OnReceived(Buffer buffer) override
         {
-            callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer, size });
+            callback(*this, PipeEventParam{ PipeEventType::RECEIVED, buffer.Pointer(), buffer.Size() });
         }
 
         virtual bool OnFireEvent(HANDLE) override { return true; }
