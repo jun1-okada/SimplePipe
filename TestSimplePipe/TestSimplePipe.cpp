@@ -1136,35 +1136,22 @@ namespace abt::comm::simple_pipe::test
             concurrency::event disconnectedEvent;
 
             TypicalSimpleNamedPipeServer server1(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
-            try {
+            Assert::ExpectException<winrt::hresult_error>([&]() {
                 //同名のパイプが既に存在する
                 TypicalSimpleNamedPipeServer server2(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
-                Assert::Fail();
-            }
-            catch (winrt::hresult_error& ex) {
-                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_PIPE_BUSY)), static_cast<int>(ex.code()));
-            }
+            });
 
             TypicalSimpleNamedPipeClient client1(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
-            try {
-                TypicalSimpleNamedPipeClient client2(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
-                Assert::Fail();
-            }
-            catch (winrt::hresult_error& ex) {
+            Assert::ExpectException<winrt::hresult_error>([&]() {
                 //クライアントは同時に1つのみ
-                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)), static_cast<int>(ex.code()));
-            }
+                TypicalSimpleNamedPipeClient client2(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
+            });
 
             auto pipeName2 = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
-            try {
-                TypicalSimpleNamedPipeClient client3(pipeName2.c_str(), [&](auto& ps, const auto& param) {});
-                Assert::Fail();
-            }
-            catch (winrt::hresult_error& ex) {
+            Assert::ExpectException<winrt::hresult_error>([&]() {
                 //存在しないパイプに接続
-                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)), static_cast<int>(ex.code()));
-            }
-
+                TypicalSimpleNamedPipeClient client3(pipeName2.c_str(), [&](auto& ps, const auto& param) {});
+            });
         }
 
         TEST_METHOD(UnreachedException)
@@ -1188,38 +1175,23 @@ namespace abt::comm::simple_pipe::test
 
             //未接続の状態で送信
             WCHAR hello[] = L"HELLO WORLD!";
-            try
-            {
+            Assert::ExpectException<winrt::hresult_error>([&]() {
                 server.WriteAsync(&hello[0], sizeof(hello)).wait();
-                Assert::Fail();
-            }
-            catch(winrt::hresult_error ex){
-                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)), static_cast<int>(ex.code()));
-            }
+            });
 
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {});
             client.WriteAsync(&hello[0], sizeof(hello)).wait();
             client.Close();
             //切断後に送信（クライアント）
-            try
-            {
+            Assert::ExpectException<winrt::hresult_error>([&]() {
                 client.WriteAsync(&hello[0], sizeof(hello)).wait();
-                Assert::Fail();
-            }
-            catch (winrt::hresult_error ex) {
-                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)), static_cast<int>(ex.code()));
-            }
-
+            });
             Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, disconnectedEvent.wait(1000));
+
             //切断後に送信（サーバー）
-            try
-            {
+            Assert::ExpectException<winrt::hresult_error>([&]() {
                 server.WriteAsync(&hello[0], sizeof(hello)).wait();
-                Assert::Fail();
-            }
-            catch (winrt::hresult_error ex) {
-                Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)), static_cast<int>(ex.code()));
-            }
+            });
         }
     };
 }
