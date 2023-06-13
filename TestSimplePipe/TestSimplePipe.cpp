@@ -12,6 +12,8 @@
 #include <ppl.h>
 #include <ppltasks.h>
 #include "CppUnitTest.h"
+
+#define SNP_TEST_MODE   //テストモード有効
 #include "../inc/SimpleNamedPipe.h"
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
@@ -470,6 +472,92 @@ namespace abt::comm::simple_pipe::test
         TEST_METHOD(WriteCancel)
         {
             auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event closedEvent;
+            constexpr size_t BUFFER_SIZE = 512;
+
+            std::vector<int> expected(512*4);
+            for (int i = 0; i < expected.size(); ++i) {
+                expected[i] = std::rand();
+            }
+            std::vector<int> actual;
+            actual.reserve(expected.size());
+
+            SimpleNamedPipeServer<BUFFER_SIZE> server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    closedEvent.set();
+                    break;
+                case PipeEventType::RECEIVED:
+                    //エコーバック
+                    ps.WriteAsync(param.readBuffer, param.readedSize).wait();
+                    break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        serverErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+            concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            concurrency::event echoComplete;
+
+            SimpleNamedPipeClient<BUFFER_SIZE> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::DISCONNECTED:
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    auto p = reinterpret_cast<const int*>(param.readBuffer);
+                    actual.insert(actual.end(), p, p + (param.readedSize / sizeof(int)));
+                    echoComplete.set();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        clientErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            concurrency::cancellation_token_source cts;
+            client.onWritePacket = [&]() {
+                //送信途中でキャンセルする
+                cts.cancel();
+            };
+
+            Assert::ExpectException<concurrency::task_canceled>([&]() {
+                client.WriteAsync(&expected[0], expected.size() * sizeof(int), cts.get_token()).get();
+            });
+
+            //0.1秒待機して受信データが来なければキャンセル成功
+            Assert::AreEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, echoComplete.wait(100));
+
+            //キャンセル後に送信可能かチェック
+            client.onWritePacket = nullptr;
+
+            client.WriteAsync(&expected[0], expected.size() * sizeof(int)).wait();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, echoComplete.wait(1000));
+            Assert::IsTrue(expected == actual);
+
+            client.Close();
+
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, closedEvent.wait(1000));
+            server.Close();
+
+            serverErrTask.wait();
+            clientErrTask.wait();
+
+        }
+
+        TEST_METHOD(WriteCancelImmediate)
+        {
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
 
             concurrency::task<void> serverErrTask = concurrency::task_from_result();
             concurrency::event closedEvent;
@@ -497,7 +585,7 @@ namespace abt::comm::simple_pipe::test
  
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
-            std::wstring echoMessage;
+            std::vector<int> actual;
 
             SimpleNamedPipeClient<BUFFER_SIZE> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
@@ -505,8 +593,8 @@ namespace abt::comm::simple_pipe::test
                     break;
                 case PipeEventType::RECEIVED:
                 {
-                    std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
-                    echoMessage = m;
+                    auto p = reinterpret_cast<const int*>(param.readBuffer);
+                    actual.insert(actual.end(), p, p + (param.readedSize / sizeof(int)));
                     echoComplete.set();
                 }
                 break;
@@ -535,9 +623,14 @@ namespace abt::comm::simple_pipe::test
             }
 
             //1秒待機して受信データが来なければキャンセル成功
-            if (concurrency::COOPERATIVE_WAIT_TIMEOUT != echoComplete.wait(1000)) {
-                Assert::Fail();
-            }
+            Assert::AreEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, echoComplete.wait(1000));
+
+            //キャンセル後に通信可能かチェック
+            client.WriteAsync(&expected[0], SAMPLE_BYTE_SIZE).wait();
+
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, echoComplete.wait(1000));
+            Assert::IsTrue(std::equal(expected.get(), expected.get() + SAMPLE_SIZE, actual.begin(), actual.end()));
+
             client.Close();
 
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
