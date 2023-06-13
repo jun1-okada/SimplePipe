@@ -767,7 +767,10 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// レシーバーを初期化
         /// </summary>
-        void ResetReceiver() { receiver.Reset(); }
+        void ResetReceiver() {
+            receiver.Reset();
+            deserializer.Reset();
+        }
 
         /// 受信イベント
         /// </summary>
