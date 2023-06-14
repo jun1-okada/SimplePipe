@@ -61,9 +61,8 @@ namespace abt::comm::simple_pipe
         virtual ~SimpleNamedPipeBase()
         {
             //監視タスク終了待ち（例外は無視）
-            Close();
-            try { watcherTask.wait(); }
-            catch (...) {};
+            try { Close(); }
+            catch (...) {}
         }
 
 #pragma region Receiver
@@ -485,7 +484,7 @@ namespace abt::comm::simple_pipe
         //パイプハンドル
         winrt::file_handle handlePipe;
         //受信用オーバーラップ構造体
-        OVERLAPPED readOverlap = { 0 };
+        std::unique_ptr<OVERLAPPED> readOverlap;
         //受信バッファー
         std::unique_ptr<BYTE[]> readBuffer;
         //Closeイベント
@@ -495,7 +494,7 @@ namespace abt::comm::simple_pipe
         //カスタムイベント
         std::vector<winrt::handle> customEvents;
         //監視タスク
-        concurrency::task<void> watcherTask;
+        concurrency::task<void> watcherTask{concurrency::task_from_result() };
         //受信パケット処理
         Receiver receiver;
         //デシリアライズ処理
@@ -571,18 +570,19 @@ namespace abt::comm::simple_pipe
         {
             //オーバーラップ構造体の設定
             WriteOverlapTag tag{ this, Buffer(buffer, size), ERROR_SUCCESS, true};
-            OVERLAPPED overlapped = { 0 };
+            auto overlapped = std::make_unique<OVERLAPPED>();
             while (!tag.Completed() && tag.success) {
                 //一度に送信するサイズをコンストラクタ引数のbufferSizeまでに制限
                 DWORD writeSize = (std::min)(static_cast<DWORD>(tag.buffer.Size()), bufferSize);
                 //WriteFileExはhEventは利用しないので、ワーク領域のポインターを格納する
                 // https://learn.microsoft.com/ja-jp/windows/win32/api/fileapi/nf-fileapi-writefileex
-                overlapped.hEvent = reinterpret_cast<HANDLE>(&tag);
-                winrt::check_bool(WriteFileEx(handlePipe.get(), tag.buffer.Pointer(), writeSize, &overlapped, &SimpleNamedPipeBase::WriteOverlapComplete));
+                *overlapped = { 0 };
+                overlapped->hEvent = reinterpret_cast<HANDLE>(&tag);
+                winrt::check_bool(WriteFileEx(handlePipe.get(), tag.buffer.Pointer(), writeSize, overlapped.get(), &SimpleNamedPipeBase::WriteOverlapComplete));
                 auto res = WaitForSingleObjectEx(cancelEvent.get(), INFINITE, true);
                 if (WAIT_OBJECT_0 == res) {
                     //非同期書き込みをキャンセル
-                    CancelIoEx(handlePipe.get(), &overlapped);
+                    CancelIoEx(handlePipe.get(), overlapped.get());
                 }
                 else if (WAIT_IO_COMPLETION == res) {
                     // I/O完了
@@ -667,6 +667,7 @@ namespace abt::comm::simple_pipe
 
         void OnReceivedPacket(const Packet* packet)
         {
+            //受信したパケットをデシリアライズ処理
             deserializer.Feed(packet);
         }
 
@@ -712,6 +713,7 @@ namespace abt::comm::simple_pipe
             : handlePipe(handle)
             , bufferSize(bufferSize)
             , limitSize(limitSize)
+            , readOverlap(std::make_unique<OVERLAPPED>())
             , readBuffer(std::make_unique<BYTE[]>(bufferSize))
             , receiver(bufferSize, limitSize, std::bind(&SimpleNamedPipeBase::OnReceivedPacket, this, std::placeholders::_1))
             , deserializer(bufferSize, limitSize, std::bind(&SimpleNamedPipeBase::OnReceived, this, std::placeholders::_1))
@@ -724,9 +726,10 @@ namespace abt::comm::simple_pipe
             }
 
             //受信イベント
+            *readOverlap = { 0 };
             readEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
             winrt::check_bool(bool{ readEvent });
-            readOverlap.hEvent = readEvent.get();
+            readOverlap->hEvent = readEvent.get();
 
             //Close要求イベント
             closeEvent = winrt::handle{ CreateEventW(nullptr, true, false, nullptr) };
@@ -803,7 +806,7 @@ namespace abt::comm::simple_pipe
         virtual WrapReadState OnRead()
         {
             DWORD readSize = 0;
-            if (!GetOverlappedResult(handlePipe.get(), &readOverlap, &readSize, FALSE)) {
+            if (!GetOverlappedResult(handlePipe.get(), readOverlap.get(), &readSize, FALSE)) {
                 auto state = WrapReadState{ GetLastError() };
                 if (state.IsInvalid()) {
                     //クローズ中のエラーは無視
@@ -825,18 +828,18 @@ namespace abt::comm::simple_pipe
         virtual WrapReadState OverappedRead()
         {
             //受信イベントリセット
-            readOverlap.Offset = 0;
-            readOverlap.OffsetHigh = 0;
+            readOverlap->Offset = 0;
+            readOverlap->OffsetHigh = 0;
             //受信処理
             // 同期的の受信できる限りは受信処理を継続
-            while (ReadFile(handlePipe.get(), readBuffer.get(), bufferSize, nullptr, &readOverlap)) {
+            while (ReadFile(handlePipe.get(), readBuffer.get(), bufferSize, nullptr, readOverlap.get())) {
                 auto state = OnRead();
                 if(state.IsDisconn()) {
                     //切断状態となった
                     return state;
                 }
-                readOverlap.Offset = 0;
-                readOverlap.OffsetHigh = 0;
+                readOverlap->Offset = 0;
+                readOverlap->OffsetHigh = 0;
             }
             //同期的に受信データを取得できないかエラーの場合
             auto state = WrapReadState{ GetLastError() };
@@ -895,6 +898,8 @@ namespace abt::comm::simple_pipe
             }
             //非同期時の送信完了待機のタスク
             return concurrency::create_task([this, buffer, size, ct]() {
+                //書き込み出来るのは同時に１つのみ
+                concurrency::critical_section::scoped_lock lock(writeCs);
                 std::atomic_bool cancelFlag{false};
                 concurrency::cancellation_token_registration cookie;
                 if (ct.is_cancelable()) {
@@ -907,8 +912,14 @@ namespace abt::comm::simple_pipe
                         catch (...) {}
                     });
                 }
-                //書き込み出来るのは同時に１つのみ
-                concurrency::critical_section::scoped_lock lock(writeCs);
+                Defer cancelDefer([&]() {
+                    if (ct.is_cancelable()) {
+                        try {
+                            ct.deregister_callback(cookie);
+                        }
+                        catch (...) {}
+                    }
+                });
                 //バッファーサイズ単位に分割して送信
                 Serializer serialier(Buffer(buffer, size), bufferSize);
                 winrt::handle dummyEvent{CreateEventW(nullptr, true, false, nullptr)};
@@ -977,7 +988,7 @@ namespace abt::comm::simple_pipe
     private:
         const winrt::hstring pipeName;
         Callback callback;
-        OVERLAPPED connectionOverlap { 0 };
+        std::unique_ptr<OVERLAPPED> connectionOverlap;
         HANDLE connectionEvent;
         HANDLE disconnectionEvent;
         std::atomic_int connectedCount{0};
@@ -988,9 +999,9 @@ namespace abt::comm::simple_pipe
         void BeginConnect()
         {
             ResetReceiver();
-            connectionOverlap = { 0 };
-            connectionOverlap.hEvent = connectionEvent;
-            if (!ConnectNamedPipe(Handle(), &connectionOverlap)) {
+            *connectionOverlap = { 0 };
+            connectionOverlap->hEvent = connectionEvent;
+            if (!ConnectNamedPipe(Handle(), connectionOverlap.get())) {
                 WrapReadState state{ GetLastError() };
                 if (state.LastErr() == ERROR_PIPE_CONNECTED) {
                     //すでに接続済み
@@ -1078,13 +1089,7 @@ namespace abt::comm::simple_pipe
         void DisconnectInner()
         {
             FlushFileBuffers(Handle());
-            if (!DisconnectNamedPipe(Handle())) {
-                auto lastErr = GetLastError();
-                if (ERROR_PIPE_NOT_CONNECTED != lastErr) {
-                    //閉じられた状態のエラーは無視
-                    winrt::throw_last_error();
-                }
-            }
+            DisconnectNamedPipe(Handle());
         }
 
     public:
@@ -1133,10 +1138,12 @@ namespace abt::comm::simple_pipe
             , callback(callback)
             , connectionEvent{ CustomEvents()[0].get() }
             , disconnectionEvent{ CustomEvents()[1].get() }
+            , connectionOverlap{std::make_unique<OVERLAPPED>()}
         {
             if (!callback) {
                 throw std::invalid_argument("bad callback error");
             }
+            *connectionOverlap = { 0 };
             //接続待ち開始
             BeginConnect();
         }
