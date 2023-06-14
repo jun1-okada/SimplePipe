@@ -416,6 +416,8 @@ namespace abt::comm::simple_pipe::test
                     Assert::Fail();
                 }
 
+                client.Close();
+
                 serverErrTask.wait();
                 clientErrTask.wait();
             }
@@ -463,6 +465,8 @@ namespace abt::comm::simple_pipe::test
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                     Assert::Fail(L"closedEvent is timeout[2]");
                 }
+                client.Close();
+
                 serverErrTask.wait();
                 clientErrTask.wait();
             }
@@ -703,6 +707,9 @@ namespace abt::comm::simple_pipe::test
             Assert::ExpectException<std::length_error>([&]() {
                 client.WriteAsync(&dummy[0], MAX_DATA_SIZE + 1).wait();
             });
+
+            client.Close();
+            server.Close();
         }
 
         TEST_METHOD(OverbufferTransfer)
@@ -789,6 +796,8 @@ namespace abt::comm::simple_pipe::test
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
+
+            server.Close();
 
             serverErrTask.wait();
             clientErrTask.wait();
@@ -1058,6 +1067,8 @@ namespace abt::comm::simple_pipe::test
             catch (std::exception& ex) {
                 Assert::AreEqual(std::string("client exception"), std::string(ex.what()));
             }
+            client.Close();
+            server.Close();
         }
 
         TEST_METHOD(LimitSizeException)
@@ -1126,14 +1137,13 @@ namespace abt::comm::simple_pipe::test
             }
             catch (std::length_error& )
             {}
+            client.Close();
+            server.Close();
         }
 
         TEST_METHOD(CreateException)
         {
             auto pipeName1 = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
-
-            concurrency::task<void> serverErrTask = concurrency::task_from_result();
-            concurrency::event disconnectedEvent;
 
             TypicalSimpleNamedPipeServer server1(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
             Assert::ExpectException<winrt::hresult_error>([&]() {
@@ -1152,6 +1162,9 @@ namespace abt::comm::simple_pipe::test
                 //存在しないパイプに接続
                 TypicalSimpleNamedPipeClient client3(pipeName2.c_str(), [&](auto& ps, const auto& param) {});
             });
+
+            client1.Close();
+            server1.Close();
         }
 
         TEST_METHOD(UnreachedException)
@@ -1192,6 +1205,9 @@ namespace abt::comm::simple_pipe::test
             Assert::ExpectException<winrt::hresult_error>([&]() {
                 server.WriteAsync(&hello[0], sizeof(hello)).wait();
             });
+
+            client.Close();
+            server.Close();
         }
     };
 }
