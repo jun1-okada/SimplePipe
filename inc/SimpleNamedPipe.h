@@ -629,6 +629,8 @@ namespace abt::comm::simple_pipe
                     //終了時のイベント通知の例外は無視する
                     try{ OnDisconnected(); }
                     catch (...) {}
+                    try { OnClosed(); }
+                    catch (...) {}
                 });
                 while (true) {
                     //接続、受信イベントを監視
@@ -819,6 +821,11 @@ namespace abt::comm::simple_pipe
         virtual bool OnFireEvent(HANDLE handle) = 0;
 
         /// <summary>
+        /// Close後のイベント
+        /// </summary>
+        virtual void OnClosed() = 0;
+
+        /// <summary>
         /// 非同期受信完了時の処理
         /// </summary>
         /// <returns>パイプデータ読み込みステータス</returns>
@@ -957,6 +964,7 @@ namespace abt::comm::simple_pipe
         {
             winrt::check_bool(SetEvent(closeEvent.get()));
             if (watchThreadId != GetCurrentThreadId()) {
+                //監視タスクと異なるスレッドであればタスク終了を待つ
                 watcherTask.wait();
             }
         }
@@ -1071,6 +1079,11 @@ namespace abt::comm::simple_pipe
             }
             //引き続きパイプの処理は続ける
             return true;
+        }
+
+        virtual void OnClosed()
+        {
+            //処理なし
         }
 
         virtual void OnTrapException(concurrency::task<void> errTask) override
@@ -1200,13 +1213,18 @@ namespace abt::comm::simple_pipe
         virtual bool OnDisconnected() override
         {
             //切断時はパイプも閉じる
-            callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
+            //切断イベントはOnClosedまで遅延
             return false;
         }
 
         virtual void OnTrapException(concurrency::task<void> errTask)
         {
             callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, errTask });
+        }
+
+        virtual void OnClosed()
+        {
+            callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
         }
 
     public:
