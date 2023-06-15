@@ -603,6 +603,9 @@ namespace abt::comm::simple_pipe
             return true;
         }
 
+        //監視タスクのスレッドID
+        DWORD watchThreadId{ 0 };
+
         /// <summary>
         /// イベント監視タスク
         /// </summary>
@@ -611,6 +614,8 @@ namespace abt::comm::simple_pipe
         {
             //タスクを実行
             return concurrency::create_task([this](){
+                //再入チェックのためにスレッドIDを保存
+                watchThreadId = GetCurrentThreadId();
                 //既知のイベント登録 Close要求イベント, 非同期I/Oの読み込み完了イベント
                 std::vector<HANDLE> handles {closeEvent.get(), readEvent.get()};
                 //派生クラスで利用するイベントを追加
@@ -618,7 +623,13 @@ namespace abt::comm::simple_pipe
                 std::transform(customEvents.begin(), customEvents.end(), std::back_inserter(customEventHandels), [](const auto& e) {return e.get(); });
                 handles.insert(handles.end(), customEventHandels.begin(), customEventHandels.end());
 
-                Defer defer([this]() {ClosePipeHandle(); });
+                Defer defer([this]() {
+                    //関数から抜ける前に必ず実行する
+                    ClosePipeHandle();
+                    //終了時のイベント通知の例外は無視する
+                    try{ OnDisconnected(); }
+                    catch (...) {}
+                });
                 while (true) {
                     //接続、受信イベントを監視
                     auto res = WaitForMultipleObjects(static_cast<DWORD>(handles.size()), &handles[0], false, INFINITE);
@@ -672,7 +683,7 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// パイプハンドルを閉じる
         /// </summary>
-        virtual void ClosePipeHandle()
+        virtual void ClosePipeHandle() noexcept
         {
             if (handlePipe) {
                 FlushFileBuffers(handlePipe.get());
@@ -945,7 +956,9 @@ namespace abt::comm::simple_pipe
         void Close()
         {
             winrt::check_bool(SetEvent(closeEvent.get()));
-            watcherTask.wait();
+            if (watchThreadId != GetCurrentThreadId()) {
+                watcherTask.wait();
+            }
         }
 
         bool Valid() const { return bool{ handlePipe }; }
@@ -1040,6 +1053,10 @@ namespace abt::comm::simple_pipe
             }
             connectedCount.fetch_sub(1);
             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
+            if (!Valid()) {
+                //ハンドルが破棄済み
+                return false;
+            }
             try {
                 //切断処理も行う
                 DisconnectInner();
@@ -1056,7 +1073,7 @@ namespace abt::comm::simple_pipe
             return true;
         }
 
-        virtual void OnTrapException(concurrency::task<void> errTask)
+        virtual void OnTrapException(concurrency::task<void> errTask) override
         {
             callback(*this, PipeEventParam{ PipeEventType::EXCEPTION, nullptr, 0, errTask });
         }
