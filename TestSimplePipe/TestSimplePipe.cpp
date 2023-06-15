@@ -75,11 +75,13 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
             std::wstring echoMessage;
 
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -107,6 +109,8 @@ namespace abt::comm::simple_pipe::test
             }
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
@@ -155,10 +159,12 @@ namespace abt::comm::simple_pipe::test
             std::vector<std::wstring> actualValues;
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
 
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -195,6 +201,8 @@ namespace abt::comm::simple_pipe::test
             }
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
@@ -253,11 +261,13 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
             std::wstring echoMessage;
             for (auto i = 0ul; i < repeat; ++i) {
                 TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                     switch (param.type) {
                     case PipeEventType::DISCONNECTED:
+                        clientDisconnected.set();
                         break;
                     case PipeEventType::RECEIVED:
                     {
@@ -285,8 +295,8 @@ namespace abt::comm::simple_pipe::test
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
                     Assert::Fail(L"echoComplete.wait timeout");
                 }
-
                 client.Close();
+                Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
                 if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                     Assert::Fail(L"closedEvent.wait timeout");
                 }
@@ -373,12 +383,14 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
             std::wstring echoMessage;
 
             {
                 TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                     switch (param.type) {
                     case PipeEventType::DISCONNECTED:
+                        clientDisconnected.set();
                         break;
                     case PipeEventType::RECEIVED:
                     {
@@ -417,6 +429,7 @@ namespace abt::comm::simple_pipe::test
                 }
 
                 client.Close();
+                Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
 
                 serverErrTask.wait();
                 clientErrTask.wait();
@@ -424,6 +437,7 @@ namespace abt::comm::simple_pipe::test
 
             connectedEvent.reset();
             echoComplete.reset();
+            clientDisconnected.reset();
             closedEvent.reset();
 
             //切断後も再接続できるか？
@@ -431,6 +445,7 @@ namespace abt::comm::simple_pipe::test
                 TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                     switch (param.type) {
                     case PipeEventType::DISCONNECTED:
+                        clientDisconnected.set();
                         break;
                     case PipeEventType::RECEIVED:
                     {
@@ -466,6 +481,7 @@ namespace abt::comm::simple_pipe::test
                     Assert::Fail(L"closedEvent is timeout[2]");
                 }
                 client.Close();
+                Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
 
                 serverErrTask.wait();
                 clientErrTask.wait();
@@ -508,10 +524,12 @@ namespace abt::comm::simple_pipe::test
             });
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
 
             SimpleNamedPipeClient<BUFFER_SIZE> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -550,6 +568,7 @@ namespace abt::comm::simple_pipe::test
             Assert::IsTrue(expected == actual);
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
 
             Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, closedEvent.wait(1000));
             server.Close();
@@ -589,11 +608,13 @@ namespace abt::comm::simple_pipe::test
  
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
             std::vector<int> actual;
 
             SimpleNamedPipeClient<BUFFER_SIZE> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -636,6 +657,7 @@ namespace abt::comm::simple_pipe::test
             Assert::IsTrue(std::equal(expected.get(), expected.get() + SAMPLE_SIZE, actual.begin(), actual.end()));
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
 
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
@@ -680,11 +702,13 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
             std::wstring echoMessage;
 
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -709,6 +733,7 @@ namespace abt::comm::simple_pipe::test
             });
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
             server.Close();
         }
 
@@ -750,6 +775,7 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
 
             auto actual = std::make_unique<int[]>(SAMPLE_SIZE);
             constexpr size_t SAMPLE_BYTE_SIZE = SAMPLE_SIZE * sizeof(int);
@@ -757,6 +783,7 @@ namespace abt::comm::simple_pipe::test
             SimpleNamedPipeClient<BUFFER_SIZE> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -793,10 +820,11 @@ namespace abt::comm::simple_pipe::test
             Assert::AreEqual(0, memcmp(&expected[0], &actual[0], SAMPLE_BYTE_SIZE));
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
-
             server.Close();
 
             serverErrTask.wait();
@@ -833,6 +861,7 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
             std::vector<std::wstring> actual;
 
             constexpr ULONG REPEAT = 20;
@@ -841,6 +870,7 @@ namespace abt::comm::simple_pipe::test
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                     {
@@ -876,6 +906,8 @@ namespace abt::comm::simple_pipe::test
             }
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
@@ -936,10 +968,12 @@ namespace abt::comm::simple_pipe::test
             auto actual = DataVector(dataCount);
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
 
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -985,6 +1019,8 @@ namespace abt::comm::simple_pipe::test
             }
 
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
                 Assert::Fail();
             }
@@ -1025,11 +1061,13 @@ namespace abt::comm::simple_pipe::test
             });
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
             concurrency::event clientErrEvent;
+            concurrency::event clientDisconnected;
             std::wstring echoMessage;
 
             TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                 {
@@ -1068,6 +1106,8 @@ namespace abt::comm::simple_pipe::test
                 Assert::AreEqual(std::string("client exception"), std::string(ex.what()));
             }
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             server.Close();
         }
 
@@ -1099,11 +1139,13 @@ namespace abt::comm::simple_pipe::test
                 }
             });
             concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            concurrency::event clientDisconnected;
             std::wstring echoMessage;
 
             SimpleNamedPipeClient<1024,18> client(pipeName.c_str(), [&](auto& ps, const auto& param) {
                 switch (param.type) {
                 case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
                     break;
                 case PipeEventType::RECEIVED:
                     break;
@@ -1138,6 +1180,8 @@ namespace abt::comm::simple_pipe::test
             catch (std::length_error& )
             {}
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
             server.Close();
         }
 
@@ -1145,13 +1189,22 @@ namespace abt::comm::simple_pipe::test
         {
             auto pipeName1 = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
 
-            TypicalSimpleNamedPipeServer server1(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
+            concurrency::event serverDisconnected;
+            concurrency::event clientDisconnected;
+
+            TypicalSimpleNamedPipeServer server1(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param)
+                {
+                    if (param.type == PipeEventType::DISCONNECTED) { serverDisconnected.set(); }
+                });
             Assert::ExpectException<winrt::hresult_error>([&]() {
                 //同名のパイプが既に存在する
                 TypicalSimpleNamedPipeServer server2(pipeName1.c_str(), nullptr, [&](auto& ps, const auto& param) {});
             });
 
-            TypicalSimpleNamedPipeClient client1(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
+            TypicalSimpleNamedPipeClient client1(pipeName1.c_str(), [&](auto& ps, const auto& param)
+                {
+                    if (param.type == PipeEventType::DISCONNECTED) { clientDisconnected.set(); }
+                });
             Assert::ExpectException<winrt::hresult_error>([&]() {
                 //クライアントは同時に1つのみ
                 TypicalSimpleNamedPipeClient client2(pipeName1.c_str(), [&](auto& ps, const auto& param) {});
@@ -1164,6 +1217,10 @@ namespace abt::comm::simple_pipe::test
             });
 
             client1.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == serverDisconnected.wait(1000)) {
+                Assert::Fail(L"echoComplete.wait timeout");
+            }
             server1.Close();
         }
 
@@ -1173,6 +1230,7 @@ namespace abt::comm::simple_pipe::test
 
             concurrency::task<void> serverErrTask = concurrency::task_from_result();
             concurrency::event disconnectedEvent;
+            concurrency::event clientDisconnected;
 
             TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
                 switch (param.type) {
@@ -1192,22 +1250,107 @@ namespace abt::comm::simple_pipe::test
                 server.WriteAsync(&hello[0], sizeof(hello)).wait();
             });
 
-            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {});
+            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                if (param.type == PipeEventType::DISCONNECTED) { clientDisconnected.set(); }
+                });
             client.WriteAsync(&hello[0], sizeof(hello)).wait();
             client.Close();
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, disconnectedEvent.wait(1000));
             //切断後に送信（クライアント）
             Assert::ExpectException<winrt::hresult_error>([&]() {
                 client.WriteAsync(&hello[0], sizeof(hello)).wait();
             });
-            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, disconnectedEvent.wait(1000));
 
             //切断後に送信（サーバー）
             Assert::ExpectException<winrt::hresult_error>([&]() {
                 server.WriteAsync(&hello[0], sizeof(hello)).wait();
             });
 
-            client.Close();
             server.Close();
+        }
+
+        TEST_METHOD(ServerShutdown)
+        {
+            auto pipeName = std::wstring(L"\\\\.\\pipe\\") + winrt::to_hstring(winrt::Windows::Foundation::GuidHelper::CreateNewGuid());
+
+            concurrency::task<void> serverErrTask = concurrency::task_from_result();
+            concurrency::event closedEvent;
+
+            TypicalSimpleNamedPipeServer server(pipeName.c_str(), nullptr, [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::CONNECTED:
+                    break;
+                case PipeEventType::DISCONNECTED:
+                    closedEvent.set();
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                    std::wostringstream oss;
+                    oss << L"echo: " << m;
+                    std::wstring echoMessage = oss.str();
+                    ps.WriteAsync(&echoMessage[0], echoMessage.size() * sizeof(WCHAR)).wait();
+                    ps.Close();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        serverErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+
+            Assert::AreEqual(std::wstring(pipeName.c_str()), std::wstring(server.PipeName().c_str()));
+
+            concurrency::task<void> clientErrTask = concurrency::task_from_result();
+            concurrency::event echoComplete;
+            concurrency::event clientDisconnected;
+            std::wstring echoMessage;
+
+            TypicalSimpleNamedPipeClient client(pipeName.c_str(), [&](auto& ps, const auto& param) {
+                switch (param.type) {
+                case PipeEventType::DISCONNECTED:
+                    clientDisconnected.set();
+                    break;
+                case PipeEventType::RECEIVED:
+                {
+                    std::wstring m(reinterpret_cast<LPCWSTR>(param.readBuffer), 0, param.readedSize / sizeof(WCHAR));
+                    echoMessage = m;
+                    echoComplete.set();
+                }
+                break;
+                case PipeEventType::EXCEPTION:
+                    //監視タスクで例外発生
+                    if (param.errTask) {
+                        clientErrTask = param.errTask.value();
+                    }
+                    break;
+                }
+            });
+            Assert::AreEqual(std::wstring(pipeName.c_str()), std::wstring(client.PipeName().c_str()));
+
+            WCHAR hello[] = L"HELLO WORLD!";
+
+            client.WriteAsync(&hello[0], sizeof(hello)).wait();
+
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == echoComplete.wait(1000)) {
+                Assert::Fail();
+            }
+
+            server.Close();
+            if (concurrency::COOPERATIVE_WAIT_TIMEOUT == closedEvent.wait(1000)) {
+                Assert::Fail();
+            }
+
+            Assert::AreNotEqual(concurrency::COOPERATIVE_WAIT_TIMEOUT, clientDisconnected.wait(1000));
+
+            serverErrTask.wait();
+            clientErrTask.wait();
+
+            Assert::AreEqual(std::wstring(L"echo: HELLO WORLD!"), echoMessage);
         }
     };
 }
