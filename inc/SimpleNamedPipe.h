@@ -501,8 +501,6 @@ namespace abt::comm::simple_pipe
         Deserializer deserializer;
         //送信バッファーロック
         concurrency::critical_section writeCs;
-        //クローズ中フラグ
-        std::atomic_bool closing{false};
         //送受信バッファーサイズ
         const DWORD bufferSize;
         //送受信上限サイズ
@@ -671,6 +669,16 @@ namespace abt::comm::simple_pipe
             deserializer.Feed(packet);
         }
 
+        /// <summary>
+        /// パイプハンドルを閉じる
+        /// </summary>
+        virtual void ClosePipeHandle()
+        {
+            if (handlePipe) {
+                FlushFileBuffers(handlePipe.get());
+                handlePipe.close();
+            }
+        }
     protected:
         /// <summary>
         /// 名前付きパイプのGetLastError値のラッパークラス
@@ -808,12 +816,7 @@ namespace abt::comm::simple_pipe
             DWORD readSize = 0;
             if (!GetOverlappedResult(handlePipe.get(), readOverlap.get(), &readSize, FALSE)) {
                 auto state = WrapReadState{ GetLastError() };
-                if (state.IsInvalid()) {
-                    //クローズ中のエラーは無視
-                    if (!closing.load()) {
-                        state.ThrowIfInvalid();
-                    }
-                }
+                state.ThrowIfInvalid();
                 return state;
             }
             //データ受信
@@ -843,11 +846,7 @@ namespace abt::comm::simple_pipe
             }
             //同期的に受信データを取得できないかエラーの場合
             auto state = WrapReadState{ GetLastError() };
-            if (state.IsInvalid()) {
-                if (!closing.load()) {
-                    state.ThrowIfInvalid();
-                }
-            }
+            state.ThrowIfInvalid();
             return state;
         }
 
@@ -866,19 +865,6 @@ namespace abt::comm::simple_pipe
             return state;
         }
 
-        /// <summary>
-        /// パイプハンドルを閉じる
-        /// </summary>
-        virtual void ClosePipeHandle()
-        {
-            bool expected = false;
-            if (closing.compare_exchange_weak(expected, true)) {
-                if (handlePipe) {
-                    FlushFileBuffers(handlePipe.get());
-                    handlePipe.close();
-                }
-            }
-        }
     public:
         /// <summary>
         /// 非同期送信処理
@@ -956,13 +942,13 @@ namespace abt::comm::simple_pipe
             return WriteAsync(buffer, size, concurrency::cancellation_token::none());
         }
 
-        virtual void Close()
+        void Close()
         {
             winrt::check_bool(SetEvent(closeEvent.get()));
             watcherTask.wait();
         }
 
-        virtual bool Valid() const { return bool{ handlePipe }; }
+        bool Valid() const { return bool{ handlePipe }; }
 
 #ifdef SNP_TEST_MODE
         //テスト用の定義
@@ -1089,7 +1075,9 @@ namespace abt::comm::simple_pipe
         void DisconnectInner()
         {
             FlushFileBuffers(Handle());
-            DisconnectNamedPipe(Handle());
+            if (!DisconnectNamedPipe(Handle())) {
+                WrapReadState{ GetLastError() }.ThrowIfInvalid();
+            }
         }
 
     public:
@@ -1251,7 +1239,12 @@ namespace abt::comm::simple_pipe
                 throw std::invalid_argument("bad callback error");
             }
             //非同期受信処理開始
-            OverappedRead();
+            auto state = OverappedRead();
+            if (state.IsDisconn()) {
+                //接続後に即切断の場合
+                callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
+                Close();
+            }
         }
 
         virtual winrt::hstring PipeName() const { return pipeName; }
