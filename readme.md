@@ -55,6 +55,9 @@ SimpleNamedPipeServer<4096> pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr, 
     case PipeEventType::RECEIVED:
         //データ受信
         break;
+    case PipeEventType::CLOSED:
+        //パイプハンドルが破棄された
+        break;
     case PipeEventType::EXCEPTION:
         //管理スレッドで例外発生
         break;
@@ -118,7 +121,7 @@ server.Disconnect();
 ### パイプ接続を閉じる
 パイプ接続を閉じて接続中のクライアントは切断するには、`Close` を利用する。
 
-インスタンスが有効な限りは例外を返さない。
+インスタンスが有効な限りは例外を送出しない。
 
 ```cpp
 server.Close();
@@ -145,6 +148,9 @@ TypicalSimpleNamedPipeServer pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr,
             std::wcout << message << std::endl;
         }
         break;
+    case PipeEventType::CLOSED:
+        //パイプハンドルが破棄された
+        break;
     case PipeEventType::EXCEPTION:
         //管理スレッドで例外発生
         //この時点でパイプ通信機能は利用できなくなる。
@@ -168,15 +174,19 @@ TypicalSimpleNamedPipeServer pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr,
 });
 ```
 #### PipeEventParam::type == PipeEventType::CONNECTED
-クライアントが接続した場合にコールバックする。
+クライアントが接続した場合にコールバックする。`SimpleNamedPipeServer` のコールバックでのみ有効。
 #### PipeEventParam::type == PipeEventType::DISCONNECTED
-クライアントが切断した場合にコールバックする。`Disconnect` を呼び出した場合、クライアントが `Close` した場合に発行する。
+クライアントが切断した場合にコールバックする。`Disconnect` を呼び出した場合、`SimpleNamedPipeClient` が `Close` した場合に発行する。
+
+`SimpleNamedPipeClient` が `Close` した場合には、呼び出し元のインスタンスは利用できない。
 #### PipeEventParam::type == PipeEventType::RECEIVED
 データ受信時にコールバックする。このデータは送信側の `WriteAsync`と1:1 で対応する。
 
 受信データは `PipeEventParam::readBuffer`, 受信サイズは`PipeEventParam::readedSize`に格納されている。
 
 バッファーの内容はこの関数中でしか保証しない。事後に利用する場合はコピーする。
+#### PipeEventParam::type == PipeEventType::CLOSED
+パイプハンドルが閉じられた際にコールバックする。これ以降は呼び出し元のインスタンスは利用できない。 `SimpleNamedPipeServer` のコールバックでのみ有効。
 
 #### PipeEventParam::type == PipeEventType::EXCEPTION
 監視タスク中の例外をコールバックする。このコールバックがあった場合は、インスタンスは利用できない状態となっている。
