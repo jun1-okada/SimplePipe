@@ -12,8 +12,8 @@ catch {}
 
 1..$cnt | Foreach-object {
     vstest.console.exe .\x64\Release\TestSimplePipe.dll /TestCaseFilter:Priority!=2 /Parallel
-    echo $_
     if(!$?){
         break
     }
+    echo $_
 }
