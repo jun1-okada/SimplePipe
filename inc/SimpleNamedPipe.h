@@ -22,12 +22,14 @@ namespace abt::comm::simple_pipe
     /// イベント種別
     /// </summary>
     enum PipeEventType {
-        //接続
+        //接続（サーバーのみ）
         CONNECTED,
         //切断
         DISCONNECTED,
         //受信
         RECEIVED,
+        //破棄（サーバーのみ）
+        CLOSED,
         //例外発生
         EXCEPTION,
     };
@@ -59,11 +61,7 @@ namespace abt::comm::simple_pipe
         SimpleNamedPipeBase& operator=(SimpleNamedPipeBase&&) = delete;
         SimpleNamedPipeBase& operator=(const SimpleNamedPipeBase&) = delete;
         virtual ~SimpleNamedPipeBase()
-        {
-            //監視タスク終了待ち（例外は無視）
-            try { Close(); }
-            catch (...) {}
-        }
+        {}
 
 #pragma region Receiver
         /// <summary>
@@ -685,7 +683,7 @@ namespace abt::comm::simple_pipe
         /// <summary>
         /// パイプハンドルを閉じる
         /// </summary>
-        virtual void ClosePipeHandle() noexcept
+         void ClosePipeHandle() noexcept
         {
             if (handlePipe) {
                 FlushFileBuffers(handlePipe.get());
@@ -1083,7 +1081,7 @@ namespace abt::comm::simple_pipe
 
         virtual void OnClosed()
         {
-            //処理なし
+            callback(*this, PipeEventParam{ PipeEventType::CLOSED, nullptr, 0 });
         }
 
         virtual void OnTrapException(concurrency::task<void> errTask) override
@@ -1182,7 +1180,14 @@ namespace abt::comm::simple_pipe
             winrt::check_bool(SetEvent(disconnectionEvent));
         }
 
-        virtual ~SimpleNamedPipeServer() {}
+        virtual ~SimpleNamedPipeServer()
+        {
+            //監視タスク終了
+            try {
+                Close();
+            }
+            catch (...) {}
+        }
     };
 
     using TypicalSimpleNamedPipeServer = SimpleNamedPipeServer<TYPICAL_BUFFER_SIZE>;
@@ -1224,6 +1229,7 @@ namespace abt::comm::simple_pipe
 
         virtual void OnClosed()
         {
+            //クライアントはこの時点で切断イベントとする
             callback(*this, PipeEventParam{ PipeEventType::DISCONNECTED, nullptr, 0 });
         }
 
@@ -1284,7 +1290,14 @@ namespace abt::comm::simple_pipe
 
         virtual winrt::hstring PipeName() const { return pipeName; }
 
-        virtual ~SimpleNamedPipeClient() {}
+        virtual ~SimpleNamedPipeClient()
+        {
+            //監視タスク終了
+            try{
+                Close();
+            }
+            catch (...) {}
+        }
     };
 
     using TypicalSimpleNamedPipeClient = SimpleNamedPipeClient<TYPICAL_BUFFER_SIZE>;
