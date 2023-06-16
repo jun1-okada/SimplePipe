@@ -1242,7 +1242,8 @@ namespace abt::comm::simple_pipe::test
                     client.WriteAsync(&data[0], sizeof(data)).wait();
                 }
                 catch (winrt::hresult_error& ex) {
-                    Assert::AreEqual(static_cast<int>(HRESULT_FROM_WIN32(ERROR_NO_DATA)), static_cast<int>(ex.code()));
+                    //サーバー側の制限にかかって、例外終了
+                    Assert::AreEqual(WC(), clientDisconnected.wait(1000));
                 }
             }
             Assert::AreEqual(WC(), serverErrEvent.wait(1000));
