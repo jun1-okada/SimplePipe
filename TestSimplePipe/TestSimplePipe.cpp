@@ -1241,7 +1241,7 @@ namespace abt::comm::simple_pipe::test
                 try {
                     client.WriteAsync(&data[0], sizeof(data)).wait();
                 }
-                catch (winrt::hresult_error& ex) {
+                catch (winrt::hresult_error& ) {
                     //サーバー側の制限にかかって、例外終了
                     Assert::AreEqual(WC(), clientDisconnected.wait(1000));
                 }

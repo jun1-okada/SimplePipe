@@ -642,7 +642,7 @@ namespace abt::comm::simple_pipe
                         break;
                     }
                     auto index = res - WAIT_OBJECT_0;
-                    if (0 <= index && index < handles.size()) {
+                    if (index < handles.size()) {
                         auto signaled = handles[index];
                         if (closeEvent.get() == signaled) {
                             //Close要求イベント
@@ -1071,7 +1071,7 @@ namespace abt::comm::simple_pipe
             }
             catch (winrt::hresult_error& ex) {
                 //INVALID_HANDLEの場合はすでにClose済みということなので例外とはしない
-                if (ex.code() != HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                if ( static_cast<HRESULT>(ex.code().value) != HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
                     throw;
                 }
             }
