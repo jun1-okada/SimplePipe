@@ -86,7 +86,7 @@ int main()
         // エラーコードの詳細は以下のページを参照
         // https://learn.microsoft.com/en-us/windows/win32/api/winerror/nf-winerror-hresult_from_win32
         // https://learn.microsoft.com/ja-jp/windows/win32/debug/system-error-codes#system-error-codes
-        if (ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+        if (ex.code().value == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
             //サーバーとなるpipeが存在しない
             std::wcerr << L"接続先が存在しません: " << PIPE_NAME << std::endl;
         }

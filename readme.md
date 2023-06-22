@@ -64,7 +64,7 @@ SimpleNamedPipeServer<4096> pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr, 
     }
 });
 } catch (winrt::hresult_error& ex) {
-    if(ex.code() == (HRESULT_FROM_WIN32(ERROR_PIPE_BUSY))){
+    if(ex.code().value == (HRESULT_FROM_WIN32(ERROR_PIPE_BUSY))){
         //同名のパイプが既に存在する
     }
     //他のエラーについてはWin32エラーコードを参照
@@ -94,11 +94,11 @@ SimpleNamedPipeServer<4096> pipeServer(L"\\\\.\\pipe\\SimplePipeTest", nullptr, 
 try{
     server.WriteAsync(buffer, size).wait();
 }catch(winrt::hresult_error& ex){
-    if(ex.code() == HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)){
+    if(ex.code().value == HRESULT_FROM_WIN32(ERROR_PIPE_LISTENING)){
         //未接続状態
-    }else if(ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA)){
+    }else if(ex.code().value == HRESULT_FROM_WIN32(ERROR_NO_DATA)){
         //パイプが閉じられた
-    }else if(ex.code() == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)){
+    }else if(ex.code().value == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)){
         //パイプハンドルが破棄済み。 このインスタンスは利用できない。
     }
     //他のエラーについてはWin32エラーコードを参照
@@ -216,7 +216,7 @@ try{
     });
 }
 catch(winrt::hresult_error& ex){
-    if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
+    if(ex.code().value == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
         //指定したパイプ名を持つパイプが存在しない
     } else if(HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)){
         //すでにサーバーには別のクライアントが接続済み
@@ -245,10 +245,11 @@ Win32エラーコードと比較する際は `HRESULT_FROM_WIN32` マクロで�
 try{
     ...
 }catch(winrt::hresult_error& ex){
-   if(ex.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
+   if(ex.code().value == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)){
         std::wcerr << L"接続先が存在しない" << std::endl;
     }
-    else if(ex.code() == HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)){
+    else if(ex.code().value == HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT) 
+            || ex.code().value == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)){
         std::wcerr << L"接続済みのクライアントがある" << std::endl;
     }
     else {
