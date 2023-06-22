@@ -39,7 +39,8 @@ int main()
                         ps.WriteAsync(&echoMessage[0], echoMessage.size() * sizeof(WCHAR), concurrency::cancellation_token::none()).wait();
                     }
                     catch (winrt::hresult_error& ex) {
-                        if (ex.code() == HRESULT_FROM_WIN32(ERROR_NO_DATA) || ex.code() == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)) {
+                        if (ex.code().value == HRESULT_FROM_WIN32(ERROR_NO_DATA)
+                            || ex.code().value == HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE)) {
                             //winrt::hresult_error::code() は エラー コード値をHRESULTに変換された値を返すので比較する際に変換した値と比較する
                             //クライアントは切断済み。これ以降も接続は受け付けるのでこのエラーはスルーする。
                             return;
@@ -86,7 +87,7 @@ int main()
         // エラーコードの詳細は以下のページを参照
         // https://learn.microsoft.com/en-us/windows/win32/api/winerror/nf-winerror-hresult_from_win32
         // https://learn.microsoft.com/ja-jp/windows/win32/debug/system-error-codes#system-error-codes
-        if (ex.code() == HRESULT_FROM_WIN32(ERROR_PIPE_BUSY)) {
+        if (ex.code().value == HRESULT_FROM_WIN32(ERROR_PIPE_BUSY)) {
             std::wcerr << L"既に実行中のサーバーが存在します: " << PIPE_NAME << std::endl;
         }
         else {
